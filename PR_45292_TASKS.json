@@ -1,0 +1,104 @@
+{
+  "overview": "Follow-up tasks for PR #45292 'settings_ui: Remote project setting files support'. Each issue could lead to data loss, silent failures, or inconsistent behavior.",
+  "problems": [
+    {
+      "id": 1,
+      "title": "Fix Silent Error Dropping",
+      "completed": true,
+      "description": "The async block in update_project_setting_file uses .detach() without any error handling. The previous implementation in project.rs used .detach_and_log_err(cx). This means file creation failures, buffer open failures, buffer save failures, and entity update failures are all silently dropped with no user feedback or logs.",
+      "current_code_lines": [
+        {
+          "file": "crates/settings_ui/src/settings_ui.rs",
+          "start_line": 3617,
+          "end_line": 3659,
+          "description": "The async spawn block that uses .detach() instead of .detach_and_log_err(cx)"
+        }
+      ],
+      "reproduction_steps": [
+        "Cause any failure in the async block (e.g., permission denied on file creation)",
+        "Observe that no error is logged and no user feedback is provided"
+      ],
+      "expected_behavior": "Errors should be logged for debugging. Consider surfacing errors to the user via toast/notification for actionable failures.",
+      "suggested_fix": "Change .detach() to .detach_and_log_err(cx) as the minimal fix. For better UX, consider propagating errors to show user feedback.",
+      "priority": "high"
+    },
+    {
+      "id": 2,
+      "title": "Handle Buffer Staleness / External Modifications",
+      "completed": true,
+      "description": "The project_setting_file_buffers cache stores buffers indefinitely without checking if the underlying file has been modified externally. When a cached buffer is used, its content may be stale, causing external edits to be overwritten.",
+      "current_code_lines": [
+        {
+          "file": "crates/settings_ui/src/settings_ui.rs",
+          "start_line": 681,
+          "end_line": 682,
+          "description": "The project_setting_file_buffers HashMap declaration"
+        },
+        {
+          "file": "crates/settings_ui/src/settings_ui.rs",
+          "start_line": 3618,
+          "end_line": 3639,
+          "description": "Buffer retrieval logic that uses cache without checking freshness"
+        },
+        {
+          "file": "crates/settings_ui/src/settings_ui.rs",
+          "start_line": 3640,
+          "end_line": 3648,
+          "description": "Buffer edit that may use stale content"
+        }
+      ],
+      "reproduction_steps": [
+        "Open Settings UI",
+        "Toggle a project setting (e.g., 'format on save') - buffer is opened and cached",
+        "Open .zed/settings.json in another editor and add a custom setting",
+        "Toggle another setting in Settings UI",
+        "Observe that the external edit from step 3 is overwritten"
+      ],
+      "expected_behavior": "Before editing the buffer, verify that the cached content matches the file on disk. If the file has been modified externally, either reload the buffer, invalidate the cache, merge changes, or warn the user.",
+      "suggested_fix": "Options include: (1) Reload buffer before each update, (2) Subscribe to file events to invalidate cache, (3) Check mtime/version before editing, (4) Remove caching entirely for guaranteed freshness.",
+      "priority": "medium"
+    },
+    {
+      "id": 3,
+      "title": "Prevent Concurrent Settings Update Race Conditions",
+      "completed": false,
+      "description": "When a user rapidly changes multiple settings, multiple async tasks are spawned concurrently. Each task reads buffer.text(), computes new content, and replaces the entire buffer. If tasks overlap, earlier changes can be overwritten by later tasks that computed their updates based on stale content.",
+      "current_code_lines": [
+        {
+          "file": "crates/settings_ui/src/settings_ui.rs",
+          "start_line": 3617,
+          "end_line": 3659,
+          "description": "The async spawn that operates independently without coordination with other concurrent updates"
+        },
+        {
+          "file": "crates/settings_ui/src/settings_ui.rs",
+          "start_line": 3640,
+          "end_line": 3648,
+          "description": "The read-modify-write sequence that is not atomic"
+        }
+      ],
+      "reproduction_steps": [
+        "Open Settings UI on a project",
+        "Rapidly toggle multiple settings in quick succession",
+        "Observe that some settings may revert to their previous values"
+      ],
+      "expected_behavior": "Settings updates should be serialized or properly merged so that rapid changes don't overwrite each other.",
+      "suggested_fix": "Options include: (1) Serial queue - store a Task handle for pending updates and chain new updates to wait for previous ones, (2) Coalesce updates - buffer changes for a debounce period then apply all at once, (3) Optimistic locking - track expected buffer version and fail/retry if buffer changed since reading.",
+      "priority": "high"
+    }
+  ],
+  "priority_order": [
+    {
+      "id": 1,
+      "reason": "Quick fix that prevents debugging nightmares in production"
+    },
+    {
+      "id": 3,
+      "reason": "Data loss in common usage pattern (rapid setting changes)"
+    },
+    {
+      "id": 2,
+      "reason": "Data loss in less common but realistic scenario (external file edits)"
+    }
+  ]
+}

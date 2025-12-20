@@ -6,14 +6,14 @@ use anyhow::{Context as _, Result};
 use editor::{Editor, EditorEvent};
 use fuzzy::StringMatchCandidate;
 use gpui::{
-    Action, App, ClipboardItem, DEFAULT_ADDITIONAL_WINDOW_SIZE, Div, Entity, FocusHandle,
+    Action, App, AsyncApp, ClipboardItem, DEFAULT_ADDITIONAL_WINDOW_SIZE, Div, Entity, FocusHandle,
     Focusable, Global, KeyContext, ListState, ReadGlobal as _, ScrollHandle, Stateful,
-    Subscription, Task, TitlebarOptions, UniformListScrollHandle, Window, WindowBounds,
+    Subscription, Task, TitlebarOptions, UniformListScrollHandle, WeakEntity, Window, WindowBounds,
     WindowHandle, WindowOptions, actions, div, list, point, prelude::*, px, uniform_list,
 };
 
 use language::Buffer;
-use project::{Project, ProjectPath, WorktreeId};
+use project::{Project, ProjectPath, Worktree, WorktreeId};
 use release_channel::ReleaseChannel;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -21,7 +21,7 @@ use settings::{Settings, SettingsContent, SettingsStore, initial_project_setting
 use std::{
     any::{Any, TypeId, type_name},
     cell::RefCell,
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     num::{NonZero, NonZeroU32},
     ops::Range,
     rc::Rc,
@@ -379,6 +379,7 @@ struct SettingsFieldMetadata {
 
 pub fn init(cx: &mut App) {
     init_renderers(cx);
+    cx.set_global(ProjectSettingsUpdateQueue::new());
 
     cx.observe_new(|workspace: &mut workspace::Workspace, _, _| {
         workspace
@@ -3579,50 +3580,95 @@ fn update_settings_file(
     }
 }
 
-fn update_project_setting_file(
+struct ProjectSettingsUpdateEntry {
     worktree_id: WorktreeId,
     rel_path: Arc<RelPath>,
-    update: impl 'static + Send + FnOnce(&mut SettingsContent, &App),
-    settings_window: Entity<SettingsWindow>,
-    cx: &mut App,
-) -> Result<()> {
-    let Some((worktree, project)) =
-        all_projects(settings_window.read(cx).original_window.as_ref(), cx).find_map(|project| {
-            project
-                .read(cx)
-                .worktree_for_id(worktree_id, cx)
-                .zip(Some(project))
-        })
-    else {
-        anyhow::bail!("Could not find project with worktree id: {}", worktree_id);
-    };
+    settings_window: WeakEntity<SettingsWindow>,
+    project: WeakEntity<Project>,
+    worktree: Entity<Worktree>,
+    needs_creation: bool,
+    update: Rc<RefCell<Option<Box<dyn FnOnce(&mut SettingsContent, &App)>>>>,
+}
 
-    let project_path = ProjectPath {
-        worktree_id,
-        path: rel_path.clone(),
-    };
+struct ProjectSettingsUpdateQueue {
+    pending: VecDeque<ProjectSettingsUpdateEntry>,
+    processing_task: Option<Task<()>>,
+}
 
-    let needs_creation = !project
-        .read(cx)
-        .contains_local_settings_file(worktree_id, &rel_path, cx);
+impl Global for ProjectSettingsUpdateQueue {}
 
-    let create_task = needs_creation.then(|| {
-        worktree.update(cx, |worktree, cx| {
-            worktree.create_entry(rel_path.clone(), false, None, cx)
-        })
-    });
-    let buffer_store = project.read(cx).buffer_store().clone();
-
-    cx.spawn(async move |cx| {
-        if let Some(create_task) = create_task {
-            create_task.await?;
+impl ProjectSettingsUpdateQueue {
+    fn new() -> Self {
+        Self {
+            pending: VecDeque::new(),
+            processing_task: None,
         }
+    }
+
+    fn enqueue(cx: &mut App, entry: ProjectSettingsUpdateEntry) {
+        cx.update_global::<Self, _>(|queue, cx| {
+            queue.pending.push_back(entry);
+            queue.process_next_if_idle(cx);
+        });
+    }
+
+    fn process_next_if_idle(&mut self, cx: &mut App) {
+        if self.processing_task.is_some() {
+            return;
+        }
+
+        let Some(entry) = self.pending.pop_front() else {
+            return;
+        };
+
+        self.processing_task = Some(cx.spawn(async move |cx| {
+            let result = Self::process_entry(entry, cx).await;
+            if let Err(err) = &result {
+                log::error!("Failed to update project settings: {err:?}");
+            }
+
+            if let Err(err) = cx.update_global::<Self, _>(|queue, cx| {
+                queue.processing_task = None;
+                queue.process_next_if_idle(cx);
+            }) {
+                log::error!("Failed to process next settings update: {err:?}");
+            }
+        }));
+    }
+
+    async fn process_entry(entry: ProjectSettingsUpdateEntry, cx: &mut AsyncApp) -> Result<()> {
+        let ProjectSettingsUpdateEntry {
+            worktree_id,
+            rel_path,
+            settings_window,
+            project,
+            worktree,
+            needs_creation,
+            update,
+        } = entry;
+
+        let project_path = ProjectPath {
+            worktree_id,
+            path: rel_path.clone(),
+        };
+
+        if needs_creation {
+            worktree
+                .update(cx, |worktree, cx| {
+                    worktree.create_entry(rel_path.clone(), false, None, cx)
+                })?
+                .await?;
+        }
+
+        let buffer_store = project.read_with(cx, |project, _cx| project.buffer_store().clone())?;
+
         let cached_buffer = settings_window.read_with(cx, |settings_window, _| {
             settings_window
                 .project_setting_file_buffers
                 .get(&project_path)
                 .cloned()
         })?;
+
         let buffer = if let Some(cached_buffer) = cached_buffer {
             let needs_reload = cached_buffer.read_with(cx, |buffer, _| buffer.has_conflict())?;
             if needs_reload {
@@ -3648,9 +3694,13 @@ fn update_project_setting_file(
 
         buffer.update(cx, |buffer, cx| {
             let current_text = buffer.text();
+            let update_fn = update
+                .borrow_mut()
+                .take()
+                .expect("update function should only be called once");
             let new_text = cx
                 .global::<SettingsStore>()
-                .new_text_for_update(current_text, |settings| update(settings, cx));
+                .new_text_for_update(current_text, |settings| update_fn(settings, cx));
             buffer.edit([(0..buffer.len(), new_text)], None, cx);
         })?;
 
@@ -3659,11 +3709,45 @@ fn update_project_setting_file(
             .await
             .context("Failed to save settings file")?;
 
-        anyhow::Ok(())
-    })
-    .detach_and_log_err(cx);
+        Ok(())
+    }
+}
 
-    return anyhow::Ok(());
+fn update_project_setting_file(
+    worktree_id: WorktreeId,
+    rel_path: Arc<RelPath>,
+    update: impl 'static + FnOnce(&mut SettingsContent, &App),
+    settings_window: Entity<SettingsWindow>,
+    cx: &mut App,
+) -> Result<()> {
+    let Some((worktree, project)) =
+        all_projects(settings_window.read(cx).original_window.as_ref(), cx).find_map(|project| {
+            project
+                .read(cx)
+                .worktree_for_id(worktree_id, cx)
+                .zip(Some(project))
+        })
+    else {
+        anyhow::bail!("Could not find project with worktree id: {}", worktree_id);
+    };
+
+    let needs_creation = !project
+        .read(cx)
+        .contains_local_settings_file(worktree_id, &rel_path, cx);
+
+    let entry = ProjectSettingsUpdateEntry {
+        worktree_id,
+        rel_path,
+        settings_window: settings_window.downgrade(),
+        project: project.downgrade(),
+        worktree,
+        needs_creation,
+        update: Rc::new(RefCell::new(Some(Box::new(update)))),
+    };
+
+    ProjectSettingsUpdateQueue::enqueue(cx, entry);
+
+    Ok(())
 }
 
 fn render_text_field<T: From<String> + Into<String> + AsRef<str> + Clone>(
