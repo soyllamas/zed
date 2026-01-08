@@ -509,12 +509,12 @@ fn build_bucketed_items(sessions: Vec<AgentSessionInfo>) -> Vec<ListItemType> {
     let today = Local::now().naive_local().date();
 
     for session in sessions.into_iter() {
-        let Some(updated_at) = session.updated_at else {
-            continue;
+        let entry_bucket = if let Some(updated_at) = session.updated_at {
+            let entry_date = updated_at.with_timezone(&Local).naive_local().date();
+            TimeBucket::from_dates(today, entry_date)
+        } else {
+            TimeBucket::Undated
         };
-
-        let entry_date = updated_at.with_timezone(&Local).naive_local().date();
-        let entry_bucket = TimeBucket::from_dates(today, entry_date);
 
         if Some(entry_bucket) != bucket {
             bucket = Some(entry_bucket);
@@ -735,6 +735,7 @@ impl From<TimeBucket> for EntryTimeFormat {
             TimeBucket::ThisWeek => EntryTimeFormat::DateAndTime,
             TimeBucket::PastWeek => EntryTimeFormat::DateAndTime,
             TimeBucket::All => EntryTimeFormat::DateAndTime,
+            TimeBucket::Undated => EntryTimeFormat::DateAndTime,
         }
     }
 }
@@ -746,6 +747,7 @@ enum TimeBucket {
     ThisWeek,
     PastWeek,
     All,
+    Undated,
 }
 
 impl TimeBucket {
@@ -782,6 +784,7 @@ impl Display for TimeBucket {
             TimeBucket::ThisWeek => write!(f, "This Week"),
             TimeBucket::PastWeek => write!(f, "Past Week"),
             TimeBucket::All => write!(f, "All"),
+            TimeBucket::Undated => write!(f, "Other"),
         }
     }
 }
@@ -831,7 +834,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_bucketed_items_skips_missing_updated_at_and_inserts_separators() {
+    fn test_build_bucketed_items_includes_missing_updated_at_and_inserts_separators() {
         let sessions = vec![
             AgentSessionInfo {
                 session_id: acp::SessionId::new("no-updated-at"),
@@ -858,28 +861,28 @@ mod tests {
 
         let items = build_bucketed_items(sessions);
 
-        // The item with no updated_at should be skipped.
+        // The item with no updated_at should be rendered.
         assert!(
-            !items.iter().any(|item| {
+            items.iter().any(|item| {
                 item.session()
                     .is_some_and(|s| s.session_id == acp::SessionId::new("no-updated-at"))
             }),
-            "sessions missing updated_at should not be rendered in bucketed view"
+            "sessions missing updated_at should be rendered in bucketed view"
         );
 
-        // We should have exactly 1 bucket separator for today's sessions.
+        // We should have exactly 2 bucket separators for undated + today's sessions.
         let bucket_separators = items
             .iter()
             .filter(|item| matches!(item, ListItemType::BucketSeparator(_)))
             .count();
-        assert_eq!(bucket_separators, 1);
+        assert_eq!(bucket_separators, 2);
 
-        // And 2 entries.
+        // And 3 entries.
         let entry_count = items
             .iter()
             .filter(|item| matches!(item, ListItemType::Entry { .. }))
             .count();
-        assert_eq!(entry_count, 2);
+        assert_eq!(entry_count, 3);
     }
 
     #[test]

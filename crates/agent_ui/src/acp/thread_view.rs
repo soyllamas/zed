@@ -266,6 +266,9 @@ impl ThreadFeedbackState {
 
 pub enum AcpThreadViewEvent {
     ThreadReady,
+    /// Emitted when the session has been modified (new entry, title change, etc.)
+    /// and the session list should be refreshed.
+    SessionModified,
 }
 
 impl EventEmitter<AcpThreadViewEvent> for AcpThreadView {}
@@ -1809,6 +1812,8 @@ impl AcpThreadView {
                 if self.message_editor.focus_handle(cx).is_focused(window) {
                     self.focus_handle.focus(window, cx)
                 }
+                // Notify that the session list may need refreshing (new message saved)
+                cx.emit(AcpThreadViewEvent::SessionModified);
             }
             AcpThreadEvent::TitleUpdated => {
                 let title = thread.read(cx).title();
@@ -1819,6 +1824,8 @@ impl AcpThreadView {
                         }
                     });
                 }
+                // Notify that the session list may need refreshing (title changed)
+                cx.emit(AcpThreadViewEvent::SessionModified);
             }
             AcpThreadEvent::PromptCapabilitiesUpdated => {
                 self.prompt_capabilities

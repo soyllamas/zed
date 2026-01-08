@@ -514,12 +514,12 @@ fn build_bucketed_items(sessions: Vec<AgentSessionInfo>) -> Vec<ListItemType> {
     let today = Local::now().naive_local().date();
 
     for session in sessions.into_iter() {
-        let Some(updated_at) = session.updated_at else {
-            continue;
+        let entry_bucket = if let Some(updated_at) = session.updated_at {
+            let entry_date = updated_at.with_timezone(&Local).naive_local().date();
+            TimeBucket::from_dates(today, entry_date)
+        } else {
+            TimeBucket::Undated
         };
-
-        let entry_date = updated_at.with_timezone(&Local).naive_local().date();
-        let entry_bucket = TimeBucket::from_dates(today, entry_date);
 
         if Some(entry_bucket) != bucket {
             bucket = Some(entry_bucket);
@@ -740,6 +740,7 @@ impl From<TimeBucket> for EntryTimeFormat {
             TimeBucket::ThisWeek => EntryTimeFormat::DateAndTime,
             TimeBucket::PastWeek => EntryTimeFormat::DateAndTime,
             TimeBucket::All => EntryTimeFormat::DateAndTime,
+            TimeBucket::Undated => EntryTimeFormat::DateAndTime,
         }
     }
 }
@@ -751,6 +752,7 @@ enum TimeBucket {
     ThisWeek,
     PastWeek,
     All,
+    Undated,
 }
 
 impl TimeBucket {
@@ -787,6 +789,7 @@ impl Display for TimeBucket {
             TimeBucket::ThisWeek => write!(f, "This Week"),
             TimeBucket::PastWeek => write!(f, "Past Week"),
             TimeBucket::All => write!(f, "All"),
+            TimeBucket::Undated => write!(f, "Other"),
         }
     }
 }

@@ -76,11 +76,6 @@ impl MentionSet {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn set_text_thread_store(&mut self, store: Entity<TextThreadStore>) {
-        self.text_thread_store = Some(store);
-    }
-
     pub fn contents(
         &self,
         full_mention_content: bool,

@@ -1672,15 +1672,16 @@ impl AgentPanel {
                             self.refresh_agent_session_snapshot(cx);
                         }
                     }
-                    // Thread is already ready; no need to subscribe to ThreadReady.
-                    self._thread_view_subscription = None;
-                } else {
-                    // Thread is still loading. Subscribe to refresh the snapshot once it becomes ready.
-                    self._thread_view_subscription = Some(cx.subscribe_in(
-                        thread_view,
-                        window,
-                        |this, thread_view, event, _window, cx| {
-                            if matches!(event, AcpThreadViewEvent::ThreadReady) {
+                }
+
+                // Subscribe to thread view events to refresh the session list when the thread
+                // becomes ready or is modified (new entry, title change, etc.).
+                self._thread_view_subscription = Some(cx.subscribe_in(
+                    thread_view,
+                    window,
+                    |this, thread_view, event, _window, cx| {
+                        match event {
+                            AcpThreadViewEvent::ThreadReady => {
                                 if let Some(thread) = thread_view.read(cx).thread().cloned() {
                                     let connection = thread.read(cx).connection().clone();
                                     if let Some(provider) = connection.session_list(cx) {
@@ -1699,9 +1700,13 @@ impl AgentPanel {
                                     }
                                 }
                             }
-                        },
-                    ));
-                }
+                            AcpThreadViewEvent::SessionModified => {
+                                // Session was modified (new entry, title change, etc.) - refresh the snapshot
+                                this.refresh_agent_session_snapshot(cx);
+                            }
+                        }
+                    },
+                ));
             }
             ActiveView::TextThread { .. }
             | ActiveView::HistoryAgent

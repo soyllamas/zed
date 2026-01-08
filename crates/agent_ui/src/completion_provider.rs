@@ -1,6 +1,6 @@
 use std::cmp::Reverse;
 use std::ops::Range;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -140,50 +140,24 @@ pub(crate) enum Match {
 }
 
 /// A thread entry for completion purposes.
-/// Works for both agent sessions and text threads.
 #[derive(Debug, Clone)]
 pub struct ThreadCompletionEntry {
     pub title: SharedString,
-    pub kind: ThreadCompletionKind,
-}
-
-#[derive(Debug, Clone)]
-pub enum ThreadCompletionKind {
-    AgentSession {
-        session_id: acp::SessionId,
-    },
-    #[allow(dead_code)]
-    TextThread {
-        path: Arc<Path>,
-    },
+    pub session_id: acp::SessionId,
 }
 
 impl ThreadCompletionEntry {
     pub fn agent_session(session_id: acp::SessionId, title: impl Into<SharedString>) -> Self {
         Self {
             title: title.into(),
-            kind: ThreadCompletionKind::AgentSession { session_id },
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn text_thread(path: Arc<Path>, title: impl Into<SharedString>) -> Self {
-        Self {
-            title: title.into(),
-            kind: ThreadCompletionKind::TextThread { path },
+            session_id,
         }
     }
 
     pub fn mention_uri(&self) -> MentionUri {
-        match &self.kind {
-            ThreadCompletionKind::AgentSession { session_id } => MentionUri::Thread {
-                id: session_id.clone(),
-                name: self.title.to_string(),
-            },
-            ThreadCompletionKind::TextThread { path } => MentionUri::TextThread {
-                path: path.to_path_buf(),
-                name: self.title.to_string(),
-            },
+        MentionUri::Thread {
+            id: self.session_id.clone(),
+            name: self.title.to_string(),
         }
     }
 }
