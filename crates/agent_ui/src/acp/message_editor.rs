@@ -1,16 +1,16 @@
 use crate::QueueMessage;
+use crate::agent_panel::AgentSessions;
 use crate::{
     ChatWithFollow,
     completion_provider::{
         PromptCompletionProvider, PromptCompletionProviderDelegate, PromptContextAction,
-        PromptContextType, SlashCommandCompletion,
+        PromptContextType, SlashCommandCompletion, ThreadCompletionEntry,
     },
     mention_set::{
         Mention, MentionImage, MentionSet, insert_crease_for_mention, paste_images_as_context,
     },
 };
 use acp_thread::MentionUri;
-use agent::HistoryStore;
 use agent_client_protocol as acp;
 use anyhow::{Result, anyhow};
 use collections::HashSet;
@@ -44,6 +44,7 @@ pub struct MessageEditor {
     prompt_capabilities: Rc<RefCell<acp::PromptCapabilities>>,
     available_commands: Rc<RefCell<Vec<acp::AvailableCommand>>>,
     agent_name: SharedString,
+    agent_sessions: Option<AgentSessions>,
     _subscriptions: Vec<Subscription>,
     _parse_slash_command_task: Task<()>,
 }
@@ -94,17 +95,33 @@ impl PromptCompletionProviderDelegate for Entity<MessageEditor> {
     fn confirm_command(&self, cx: &mut App) {
         self.update(cx, |this, cx| this.send(cx));
     }
+
+    fn thread_entries(&self, cx: &App) -> Vec<ThreadCompletionEntry> {
+        let Some(sessions) = &self.read(cx).agent_sessions else {
+            return Vec::new();
+        };
+        sessions
+            .get()
+            .into_iter()
+            .map(|session| {
+                ThreadCompletionEntry::agent_session(
+                    session.session_id.clone(),
+                    session.display_title(),
+                )
+            })
+            .collect()
+    }
 }
 
 impl MessageEditor {
     pub fn new(
         workspace: WeakEntity<Workspace>,
         project: WeakEntity<Project>,
-        history_store: Entity<HistoryStore>,
         prompt_store: Option<Entity<PromptStore>>,
         prompt_capabilities: Rc<RefCell<acp::PromptCapabilities>>,
         available_commands: Rc<RefCell<Vec<acp::AvailableCommand>>>,
         agent_name: SharedString,
+        agent_sessions: Option<AgentSessions>,
         placeholder: &str,
         mode: EditorMode,
         window: &mut Window,
@@ -151,13 +168,11 @@ impl MessageEditor {
 
             editor
         });
-        let mention_set =
-            cx.new(|_cx| MentionSet::new(project, history_store.clone(), prompt_store.clone()));
+        let mention_set = cx.new(|_cx| MentionSet::new(project, prompt_store.clone()));
         let completion_provider = Rc::new(PromptCompletionProvider::new(
             cx.entity(),
             editor.downgrade(),
             mention_set.clone(),
-            history_store.clone(),
             prompt_store.clone(),
             workspace.clone(),
         ));
@@ -215,6 +230,7 @@ impl MessageEditor {
             prompt_capabilities,
             available_commands,
             agent_name,
+            agent_sessions,
             _subscriptions: subscriptions,
             _parse_slash_command_task: Task::ready(()),
         }
@@ -1062,9 +1078,8 @@ mod tests {
     use std::{cell::RefCell, ops::Range, path::Path, rc::Rc, sync::Arc};
 
     use acp_thread::MentionUri;
-    use agent::{HistoryStore, outline};
+    use agent::outline;
     use agent_client_protocol as acp;
-    use assistant_text_thread::TextThreadStore;
     use editor::{AnchorRangeExt as _, Editor, EditorMode, MultiBufferOffset};
     use fs::FakeFs;
     use futures::StreamExt as _;
@@ -1096,19 +1111,16 @@ mod tests {
         let (workspace, cx) =
             cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
 
-        let text_thread_store = cx.new(|cx| TextThreadStore::fake(project.clone(), cx));
-        let history_store = cx.new(|cx| HistoryStore::new(text_thread_store, cx));
-
         let message_editor = cx.update(|window, cx| {
             cx.new(|cx| {
                 MessageEditor::new(
                     workspace.downgrade(),
                     project.downgrade(),
-                    history_store.clone(),
                     None,
                     Default::default(),
                     Default::default(),
                     "Test Agent".into(),
+                    None,
                     "Test",
                     EditorMode::AutoHeight {
                         min_lines: 1,
@@ -1201,8 +1213,6 @@ mod tests {
         .await;
 
         let project = Project::test(fs.clone(), ["/test".as_ref()], cx).await;
-        let text_thread_store = cx.new(|cx| TextThreadStore::fake(project.clone(), cx));
-        let history_store = cx.new(|cx| HistoryStore::new(text_thread_store, cx));
         let prompt_capabilities = Rc::new(RefCell::new(acp::PromptCapabilities::default()));
         // Start with no available commands - simulating Claude which doesn't support slash commands
         let available_commands = Rc::new(RefCell::new(vec![]));
@@ -1215,11 +1225,11 @@ mod tests {
                 MessageEditor::new(
                     workspace_handle.clone(),
                     project.downgrade(),
-                    history_store.clone(),
                     None,
                     prompt_capabilities.clone(),
                     available_commands.clone(),
                     "Claude Code".into(),
+                    None,
                     "Test",
                     EditorMode::AutoHeight {
                         min_lines: 1,
@@ -1358,8 +1368,6 @@ mod tests {
 
         let mut cx = VisualTestContext::from_window(*window, cx);
 
-        let text_thread_store = cx.new(|cx| TextThreadStore::fake(project.clone(), cx));
-        let history_store = cx.new(|cx| HistoryStore::new(text_thread_store, cx));
         let prompt_capabilities = Rc::new(RefCell::new(acp::PromptCapabilities::default()));
         let available_commands = Rc::new(RefCell::new(vec![
             acp::AvailableCommand::new("quick-math", "2 + 2 = 4 - 1 = 3"),
@@ -1376,11 +1384,11 @@ mod tests {
                 MessageEditor::new(
                     workspace_handle,
                     project.downgrade(),
-                    history_store.clone(),
                     None,
                     prompt_capabilities.clone(),
                     available_commands.clone(),
                     "Test Agent".into(),
+                    None,
                     "Test",
                     EditorMode::AutoHeight {
                         max_lines: None,
@@ -1588,8 +1596,6 @@ mod tests {
             opened_editors.push(buffer);
         }
 
-        let text_thread_store = cx.new(|cx| TextThreadStore::fake(project.clone(), cx));
-        let history_store = cx.new(|cx| HistoryStore::new(text_thread_store, cx));
         let prompt_capabilities = Rc::new(RefCell::new(acp::PromptCapabilities::default()));
 
         let (message_editor, editor) = workspace.update_in(&mut cx, |workspace, window, cx| {
@@ -1598,11 +1604,11 @@ mod tests {
                 MessageEditor::new(
                     workspace_handle,
                     project.downgrade(),
-                    history_store.clone(),
                     None,
                     prompt_capabilities.clone(),
                     Default::default(),
                     "Test Agent".into(),
+                    None,
                     "Test",
                     EditorMode::AutoHeight {
                         max_lines: None,
@@ -2081,19 +2087,16 @@ mod tests {
         let (workspace, cx) =
             cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
 
-        let text_thread_store = cx.new(|cx| TextThreadStore::fake(project.clone(), cx));
-        let history_store = cx.new(|cx| HistoryStore::new(text_thread_store, cx));
-
         let message_editor = cx.update(|window, cx| {
             cx.new(|cx| {
                 let editor = MessageEditor::new(
                     workspace.downgrade(),
                     project.downgrade(),
-                    history_store.clone(),
                     None,
                     Default::default(),
                     Default::default(),
                     "Test Agent".into(),
+                    None,
                     "Test",
                     EditorMode::AutoHeight {
                         min_lines: 1,
@@ -2179,9 +2182,6 @@ mod tests {
         let (workspace, cx) =
             cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
 
-        let text_thread_store = cx.new(|cx| TextThreadStore::fake(project.clone(), cx));
-        let history_store = cx.new(|cx| HistoryStore::new(text_thread_store, cx));
-
         // Create a thread metadata to insert as summary
         let thread_metadata = agent::DbThreadMetadata {
             id: acp::SessionId::new("thread-123"),
@@ -2194,11 +2194,11 @@ mod tests {
                 let mut editor = MessageEditor::new(
                     workspace.downgrade(),
                     project.downgrade(),
-                    history_store.clone(),
                     None,
                     Default::default(),
                     Default::default(),
                     "Test Agent".into(),
+                    None,
                     "Test",
                     EditorMode::AutoHeight {
                         min_lines: 1,
@@ -2255,19 +2255,16 @@ mod tests {
         let (workspace, cx) =
             cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
 
-        let text_thread_store = cx.new(|cx| TextThreadStore::fake(project.clone(), cx));
-        let history_store = cx.new(|cx| HistoryStore::new(text_thread_store, cx));
-
         let message_editor = cx.update(|window, cx| {
             cx.new(|cx| {
                 MessageEditor::new(
                     workspace.downgrade(),
                     project.downgrade(),
-                    history_store.clone(),
                     None,
                     Default::default(),
                     Default::default(),
                     "Test Agent".into(),
+                    None,
                     "Test",
                     EditorMode::AutoHeight {
                         min_lines: 1,
@@ -2317,20 +2314,17 @@ mod tests {
         let (workspace, cx) =
             cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
 
-        let text_thread_store = cx.new(|cx| TextThreadStore::fake(project.clone(), cx));
-        let history_store = cx.new(|cx| HistoryStore::new(text_thread_store, cx));
-
         let (message_editor, editor) = workspace.update_in(cx, |workspace, window, cx| {
             let workspace_handle = cx.weak_entity();
             let message_editor = cx.new(|cx| {
                 MessageEditor::new(
                     workspace_handle,
                     project.downgrade(),
-                    history_store.clone(),
                     None,
                     Default::default(),
                     Default::default(),
                     "Test Agent".into(),
+                    None,
                     "Test",
                     EditorMode::AutoHeight {
                         max_lines: None,
@@ -2472,9 +2466,6 @@ mod tests {
             });
         });
 
-        let text_thread_store = cx.new(|cx| TextThreadStore::fake(project.clone(), cx));
-        let history_store = cx.new(|cx| HistoryStore::new(text_thread_store, cx));
-
         // Create a new `MessageEditor`. The `EditorMode::full()` has to be used
         // to ensure we have a fixed viewport, so we can eventually actually
         // place the cursor outside of the visible area.
@@ -2484,11 +2475,11 @@ mod tests {
                 MessageEditor::new(
                     workspace_handle,
                     project.downgrade(),
-                    history_store.clone(),
                     None,
                     Default::default(),
                     Default::default(),
                     "Test Agent".into(),
+                    None,
                     "Test",
                     EditorMode::full(),
                     window,

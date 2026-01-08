@@ -1,14 +1,13 @@
 use crate::{RemoveHistory, RemoveSelectedThread};
-use acp_thread::{AgentSessionInfo, AgentSessionList, SessionListParams};
-use agent_client_protocol as acp;
-use chrono::{Datelike as _, Local, NaiveDate, TimeDelta, Utc};
+use assistant_text_thread::{SavedTextThreadMetadata, TextThreadStore};
+use chrono::{Datelike as _, Local, NaiveDate, TimeDelta};
 use editor::{Editor, EditorEvent};
 use fuzzy::StringMatchCandidate;
 use gpui::{
     App, BackgroundExecutor, Entity, EventEmitter, FocusHandle, Focusable, ScrollStrategy, Task,
-    UniformListScrollHandle, Window, uniform_list,
+    UniformListScrollHandle, WeakEntity, Window, uniform_list,
 };
-use std::{fmt::Display, ops::Range, rc::Rc};
+use std::{fmt::Display, ops::Range, path::Path, sync::Arc};
 use text::Bias;
 use time::{OffsetDateTime, UtcOffset};
 use ui::{
@@ -17,10 +16,8 @@ use ui::{
 };
 use util::ResultExt as _;
 
-pub struct AcpThreadHistory {
-    session_list: Rc<dyn AgentSessionList>,
-    delete_supported: bool,
-    delete_all_supported: bool,
+pub struct TextThreadHistory {
+    text_thread_store: WeakEntity<TextThreadStore>,
     scroll_handle: UniformListScrollHandle,
     selected_index: usize,
     hovered_index: Option<usize>,
@@ -36,17 +33,17 @@ pub struct AcpThreadHistory {
 enum ListItemType {
     BucketSeparator(TimeBucket),
     Entry {
-        entry: AgentSessionInfo,
+        entry: SavedTextThreadMetadata,
         format: EntryTimeFormat,
     },
     SearchResult {
-        entry: AgentSessionInfo,
+        entry: SavedTextThreadMetadata,
         positions: Vec<usize>,
     },
 }
 
 impl ListItemType {
-    fn session(&self) -> Option<&AgentSessionInfo> {
+    fn entry(&self) -> Option<&SavedTextThreadMetadata> {
         match self {
             ListItemType::Entry { entry, .. } => Some(entry),
             ListItemType::SearchResult { entry, .. } => Some(entry),
@@ -55,15 +52,15 @@ impl ListItemType {
     }
 }
 
-pub enum ThreadHistoryEvent {
-    OpenSession(acp::SessionId),
+pub enum TextThreadHistoryEvent {
+    OpenTextThread(Arc<Path>),
 }
 
-impl EventEmitter<ThreadHistoryEvent> for AcpThreadHistory {}
+impl EventEmitter<TextThreadHistoryEvent> for TextThreadHistory {}
 
-impl AcpThreadHistory {
+impl TextThreadHistory {
     pub(crate) fn new(
-        session_list: Rc<dyn AgentSessionList>,
+        text_thread_store: WeakEntity<TextThreadStore>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -86,17 +83,12 @@ impl AcpThreadHistory {
 
         let scroll_handle = UniformListScrollHandle::default();
 
-        let delete_supported = session_list.supports_delete();
-        let delete_all_supported = session_list.delete_all_sessions(cx).is_some();
-
         let local_timezone =
             UtcOffset::from_whole_seconds(chrono::Local::now().offset().local_minus_utc())
                 .unwrap_or_else(|_| UtcOffset::UTC);
 
         let mut this = Self {
-            session_list,
-            delete_supported,
-            delete_all_supported,
+            text_thread_store,
             scroll_handle,
             selected_index: 0,
             hovered_index: None,
@@ -112,66 +104,43 @@ impl AcpThreadHistory {
         this
     }
 
-    pub(crate) fn set_session_list(
-        &mut self,
-        session_list: Rc<dyn AgentSessionList>,
-        cx: &mut Context<Self>,
-    ) {
-        self.delete_supported = session_list.supports_delete();
-        self.delete_all_supported = session_list.delete_all_sessions(cx).is_some();
-        self.session_list = session_list;
-        self.update_visible_items(true, cx);
-        cx.notify();
-    }
-
-    pub(crate) fn refresh(&mut self, cx: &mut Context<Self>) {
-        self.update_visible_items(true, cx);
-        cx.notify();
-    }
-
     fn update_visible_items(&mut self, preserve_selected_item: bool, cx: &mut Context<Self>) {
-        let list_task = self.session_list.list(SessionListParams::default(), cx);
+        let Some(store) = self.text_thread_store.upgrade() else {
+            return;
+        };
+
+        let mut threads: Vec<SavedTextThreadMetadata> =
+            store.read(cx).unordered_text_threads().cloned().collect();
+        threads.sort_by(|a, b| b.mtime.cmp(&a.mtime));
 
         let query = self.search_query.clone();
-        let selected_session_id = if preserve_selected_item {
-            self.selected_session_id().cloned()
+        let selected_path = if preserve_selected_item {
+            self.selected_path().cloned()
         } else {
             None
         };
 
+        let background_executor = cx.background_executor().clone();
+
         self._update_task = cx.spawn(async move |this, cx| {
-            let result = match list_task.await {
-                Ok(result) => result,
-                Err(err) => {
-                    log::error!("Failed to list agent sessions: {err:?}");
-                    return;
-                }
-            };
-
-            let mut sessions = result.sessions;
-            sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-
-            let query = query.clone();
-            let background_executor = cx.background_executor().clone();
-
             let new_visible_items = cx
                 .background_spawn(async move {
                     if query.is_empty() {
-                        build_bucketed_items(sessions)
+                        build_bucketed_items(threads)
                     } else {
-                        build_search_items(sessions, query, background_executor).await
+                        build_search_items(threads, query, background_executor).await
                     }
                 })
                 .await;
 
             if let Err(err) = this.update(cx, |this, cx| {
-                let new_selected_index = if let Some(session_id) = selected_session_id {
+                let new_selected_index = if let Some(path) = selected_path {
                     new_visible_items
                         .iter()
                         .position(|visible_entry| {
                             visible_entry
-                                .session()
-                                .is_some_and(|entry| entry.session_id == session_id)
+                                .entry()
+                                .is_some_and(|entry| entry.path == path)
                         })
                         .unwrap_or(0)
                 } else {
@@ -182,7 +151,7 @@ impl AcpThreadHistory {
                 this.set_selected_index(new_selected_index, Bias::Right, cx);
                 cx.notify();
             }) {
-                log::error!("Failed to update agent session history UI: {err:?}");
+                log::error!("Failed to update text thread history UI: {err:?}");
             }
         });
     }
@@ -191,17 +160,16 @@ impl AcpThreadHistory {
         self.visible_items.is_empty() && !self.search_query.is_empty()
     }
 
-    fn selected_session_id(&self) -> Option<&acp::SessionId> {
-        self.get_session(self.selected_index)
-            .map(|session| &session.session_id)
+    fn selected_path(&self) -> Option<&Arc<Path>> {
+        self.get_entry(self.selected_index).map(|entry| &entry.path)
     }
 
-    fn get_session(&self, visible_items_ix: usize) -> Option<&AgentSessionInfo> {
-        self.visible_items.get(visible_items_ix)?.session()
+    fn get_entry(&self, visible_items_ix: usize) -> Option<&SavedTextThreadMetadata> {
+        self.visible_items.get(visible_items_ix)?.entry()
     }
 
     fn set_selected_index(&mut self, mut index: usize, bias: Bias, cx: &mut Context<Self>) {
-        if self.visible_items.len() == 0 {
+        if self.visible_items.is_empty() {
             self.selected_index = 0;
             return;
         }
@@ -276,10 +244,10 @@ impl AcpThreadHistory {
     }
 
     fn confirm_entry(&mut self, ix: usize, cx: &mut Context<Self>) {
-        let Some(session) = self.get_session(ix) else {
+        let Some(entry) = self.get_entry(ix) else {
             return;
         };
-        cx.emit(ThreadHistoryEvent::OpenSession(session.session_id.clone()));
+        cx.emit(TextThreadHistoryEvent::OpenTextThread(entry.path.clone()));
     }
 
     fn remove_selected_thread(
@@ -292,22 +260,20 @@ impl AcpThreadHistory {
     }
 
     fn remove_thread(&mut self, visible_item_ix: usize, cx: &mut Context<Self>) {
-        if !self.delete_supported {
-            return;
-        }
-
-        let Some(session) = self.get_session(visible_item_ix) else {
+        let Some(entry) = self.get_entry(visible_item_ix) else {
             return;
         };
 
-        let Some(deleter) = self.session_list.delete_session(&session.session_id, cx) else {
+        let Some(store) = self.text_thread_store.upgrade() else {
             return;
         };
 
-        let delete_task = deleter.run(cx);
+        let path = entry.path.clone();
+        let delete_task = store.update(cx, |store, cx| store.delete_local(path, cx));
+
         cx.spawn(async move |this, cx| {
             if let Err(err) = delete_task.await {
-                log::error!("Failed to delete agent session: {err:?}");
+                log::error!("Failed to delete text thread: {err:?}");
                 return;
             }
 
@@ -321,23 +287,25 @@ impl AcpThreadHistory {
     }
 
     fn remove_history(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some(deleter) = self.session_list.delete_all_sessions(cx) else {
+        let Some(store) = self.text_thread_store.upgrade() else {
             self.confirming_delete_history = false;
             cx.notify();
             return;
         };
 
-        let delete_task = deleter.run(cx);
+        let paths: Vec<Arc<Path>> = store
+            .read(cx)
+            .unordered_text_threads()
+            .map(|t| t.path.clone())
+            .collect();
+
         self.confirming_delete_history = false;
 
         cx.spawn(async move |this, cx| {
-            if let Err(err) = delete_task.await {
-                log::error!("Failed to delete all agent sessions: {err:?}");
-                return;
+            for path in paths {
+                store.update(cx, |store, cx| store.delete_local(path, cx));
             }
 
-            // Recompute visible items by re-running the normal listing flow.
-            // This keeps selection logic and search/bucketing behavior consistent.
             this.update(cx, |this, cx| {
                 this.update_visible_items(false, cx);
                 cx.notify();
@@ -401,7 +369,7 @@ impl AcpThreadHistory {
 
     fn render_history_entry(
         &self,
-        entry: &AgentSessionInfo,
+        entry: &SavedTextThreadMetadata,
         format: EntryTimeFormat,
         ix: usize,
         highlight_positions: Vec<usize>,
@@ -410,32 +378,22 @@ impl AcpThreadHistory {
         let selected = ix == self.selected_index;
         let hovered = Some(ix) == self.hovered_index;
 
-        let (timestamp, display_text, full_date) = if let Some(updated_at) = entry.updated_at {
-            let timestamp = updated_at.timestamp();
+        let timestamp = entry.mtime.timestamp();
 
-            let display_text = match format {
-                EntryTimeFormat::DateAndTime => {
-                    let now = Utc::now();
-                    let duration = now.signed_duration_since(updated_at);
-                    let days = duration.num_days();
-
-                    format!("{}d", days)
-                }
-                EntryTimeFormat::TimeOnly => {
-                    format.format_timestamp(timestamp, self.local_timezone)
-                }
-            };
-
-            let full_date =
-                EntryTimeFormat::DateAndTime.format_timestamp(timestamp, self.local_timezone);
-
-            (Some(timestamp), display_text, Some(full_date))
-        } else {
-            (None, String::new(), None)
+        let display_text = match format {
+            EntryTimeFormat::DateAndTime => {
+                let now = Local::now();
+                let duration = now.signed_duration_since(entry.mtime);
+                let days = duration.num_days();
+                format!("{}d", days)
+            }
+            EntryTimeFormat::TimeOnly => format.format_timestamp(timestamp, self.local_timezone),
         };
 
-        let title = session_title(entry);
-        let can_delete = self.delete_supported;
+        let full_date =
+            EntryTimeFormat::DateAndTime.format_timestamp(timestamp, self.local_timezone);
+
+        let title = entry_title(entry);
 
         h_flex()
             .w_full()
@@ -455,17 +413,15 @@ impl AcpThreadHistory {
                                     .size(LabelSize::Small)
                                     .truncate(),
                             )
-                            .children(timestamp.map(|_timestamp| {
+                            .child(
                                 Label::new(display_text)
                                     .color(Color::Muted)
                                     .size(LabelSize::XSmall)
-                                    .into_any_element()
-                            })),
+                                    .into_any_element(),
+                            ),
                     )
-                    .when_some(full_date, |this, full_date| {
-                        this.tooltip(move |_, cx| {
-                            Tooltip::with_meta(title.clone(), None, full_date.clone(), cx)
-                        })
+                    .tooltip(move |_, cx| {
+                        Tooltip::with_meta(title.clone(), None, full_date.clone(), cx)
                     })
                     .on_hover(cx.listener(move |this, is_hovered, _window, cx| {
                         if *is_hovered {
@@ -476,7 +432,7 @@ impl AcpThreadHistory {
 
                         cx.notify();
                     }))
-                    .end_slot::<IconButton>(if hovered && can_delete {
+                    .end_slot::<IconButton>(if hovered {
                         Some(
                             IconButton::new("delete", IconName::Trash)
                                 .shape(IconButtonShape::Square)
@@ -499,21 +455,22 @@ impl AcpThreadHistory {
     }
 }
 
-fn session_title(session: &AgentSessionInfo) -> SharedString {
-    session.display_title()
+fn entry_title(entry: &SavedTextThreadMetadata) -> SharedString {
+    let title = entry.title.trim();
+    if title.is_empty() {
+        SharedString::from("New Thread")
+    } else {
+        entry.title.clone()
+    }
 }
 
-fn build_bucketed_items(sessions: Vec<AgentSessionInfo>) -> Vec<ListItemType> {
-    let mut items = Vec::with_capacity(sessions.len() + 1);
+fn build_bucketed_items(threads: Vec<SavedTextThreadMetadata>) -> Vec<ListItemType> {
+    let mut items = Vec::with_capacity(threads.len() + 1);
     let mut bucket = None;
     let today = Local::now().naive_local().date();
 
-    for session in sessions.into_iter() {
-        let Some(updated_at) = session.updated_at else {
-            continue;
-        };
-
-        let entry_date = updated_at.with_timezone(&Local).naive_local().date();
+    for thread in threads.into_iter() {
+        let entry_date = thread.mtime.naive_local().date();
         let entry_bucket = TimeBucket::from_dates(today, entry_date);
 
         if Some(entry_bucket) != bucket {
@@ -522,7 +479,7 @@ fn build_bucketed_items(sessions: Vec<AgentSessionInfo>) -> Vec<ListItemType> {
         }
 
         items.push(ListItemType::Entry {
-            entry: session,
+            entry: thread,
             format: entry_bucket.into(),
         });
     }
@@ -531,13 +488,13 @@ fn build_bucketed_items(sessions: Vec<AgentSessionInfo>) -> Vec<ListItemType> {
 }
 
 async fn build_search_items(
-    sessions: Vec<AgentSessionInfo>,
+    threads: Vec<SavedTextThreadMetadata>,
     query: SharedString,
     background_executor: BackgroundExecutor,
 ) -> Vec<ListItemType> {
-    let mut candidates = Vec::with_capacity(sessions.len());
-    for (idx, session) in sessions.iter().enumerate() {
-        let title = session_title(session);
+    let mut candidates = Vec::with_capacity(threads.len());
+    for (idx, thread) in threads.iter().enumerate() {
+        let title = entry_title(thread);
         candidates.push(StringMatchCandidate::new(idx, title.as_ref()));
     }
 
@@ -557,24 +514,24 @@ async fn build_search_items(
     matches
         .into_iter()
         .map(|search_match| ListItemType::SearchResult {
-            entry: sessions[search_match.candidate_id].clone(),
+            entry: threads[search_match.candidate_id].clone(),
             positions: search_match.positions,
         })
         .collect()
 }
 
-impl Focusable for AcpThreadHistory {
+impl Focusable for TextThreadHistory {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.search_editor.focus_handle(cx)
     }
 }
 
-impl Render for AcpThreadHistory {
+impl Render for TextThreadHistory {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let has_no_history = self.visible_items.is_empty() && self.search_query.is_empty();
 
         v_flex()
-            .key_context("ThreadHistory")
+            .key_context("TextThreadHistory")
             .size_full()
             .bg(cx.theme().colors().panel_background)
             .on_action(cx.listener(Self::select_previous))
@@ -623,7 +580,7 @@ impl Render for AcpThreadHistory {
                 } else {
                     view.child(
                         uniform_list(
-                            "thread-history",
+                            "text-thread-history",
                             self.visible_items.len(),
                             cx.processor(|this, range: Range<usize>, window, cx| {
                                 this.render_list_items(range, window, cx)
@@ -646,14 +603,10 @@ impl Render for AcpThreadHistory {
                         .when(!self.confirming_delete_history, |this| {
                             this.child(
                                 Button::new("delete_history", "Delete All History")
-                                    .disabled(!self.delete_all_supported)
                                     .full_width()
                                     .style(ButtonStyle::Outlined)
                                     .label_size(LabelSize::Small)
                                     .on_click(cx.listener(|this, _, window, cx| {
-                                        if !this.delete_all_supported {
-                                            return;
-                                        }
                                         this.prompt_delete_history(window, cx);
                                     })),
                             )
@@ -704,7 +657,7 @@ impl Render for AcpThreadHistory {
 }
 
 #[derive(Clone, Copy)]
-pub enum EntryTimeFormat {
+enum EntryTimeFormat {
     DateAndTime,
     TimeOnly,
 }
@@ -789,126 +742,168 @@ impl Display for TimeBucket {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{NaiveDate, TimeZone as _, Utc};
+    use chrono::{Local, NaiveDate, TimeDelta};
 
     #[test]
     fn test_time_bucket_from_dates() {
-        let today = NaiveDate::from_ymd_opt(2023, 1, 15).unwrap();
+        let today = NaiveDate::from_ymd_opt(2024, 6, 15).unwrap(); // Saturday
 
-        let date = today;
-        assert_eq!(TimeBucket::from_dates(today, date), TimeBucket::Today);
+        assert_eq!(TimeBucket::from_dates(today, today), TimeBucket::Today);
 
-        let date = NaiveDate::from_ymd_opt(2023, 1, 14).unwrap();
-        assert_eq!(TimeBucket::from_dates(today, date), TimeBucket::Yesterday);
-
-        let date = NaiveDate::from_ymd_opt(2023, 1, 13).unwrap();
-        assert_eq!(TimeBucket::from_dates(today, date), TimeBucket::ThisWeek);
-
-        let date = NaiveDate::from_ymd_opt(2023, 1, 11).unwrap();
-        assert_eq!(TimeBucket::from_dates(today, date), TimeBucket::ThisWeek);
-
-        let date = NaiveDate::from_ymd_opt(2023, 1, 8).unwrap();
-        assert_eq!(TimeBucket::from_dates(today, date), TimeBucket::PastWeek);
-
-        let date = NaiveDate::from_ymd_opt(2023, 1, 5).unwrap();
-        assert_eq!(TimeBucket::from_dates(today, date), TimeBucket::PastWeek);
-
-        // All: not in this week or last week
-        let date = NaiveDate::from_ymd_opt(2023, 1, 1).unwrap();
-        assert_eq!(TimeBucket::from_dates(today, date), TimeBucket::All);
-
-        // Test year boundary cases
-        let new_year = NaiveDate::from_ymd_opt(2023, 1, 1).unwrap();
-
-        let date = NaiveDate::from_ymd_opt(2022, 12, 31).unwrap();
+        let yesterday = today - TimeDelta::days(1);
         assert_eq!(
-            TimeBucket::from_dates(new_year, date),
+            TimeBucket::from_dates(today, yesterday),
             TimeBucket::Yesterday
         );
 
-        let date = NaiveDate::from_ymd_opt(2022, 12, 28).unwrap();
-        assert_eq!(TimeBucket::from_dates(new_year, date), TimeBucket::ThisWeek);
+        let earlier_this_week = today - TimeDelta::days(5);
+        assert_eq!(
+            TimeBucket::from_dates(today, earlier_this_week),
+            TimeBucket::ThisWeek
+        );
+
+        let last_week = today - TimeDelta::days(10);
+        assert_eq!(
+            TimeBucket::from_dates(today, last_week),
+            TimeBucket::PastWeek
+        );
+
+        let long_ago = today - TimeDelta::days(30);
+        assert_eq!(TimeBucket::from_dates(today, long_ago), TimeBucket::All);
     }
 
     #[test]
-    fn test_build_bucketed_items_skips_missing_updated_at_and_inserts_separators() {
-        let sessions = vec![
-            AgentSessionInfo {
-                session_id: acp::SessionId::new("no-updated-at"),
-                cwd: None,
-                title: Some("No UpdatedAt".into()),
-                updated_at: None,
-                meta: None,
+    fn test_entry_title_fallback_and_trimming() {
+        fn make_entry(title: &str) -> SavedTextThreadMetadata {
+            SavedTextThreadMetadata {
+                title: title.to_string().into(),
+                path: Arc::from(Path::new("/test/path.json")),
+                mtime: Local::now(),
+            }
+        }
+
+        assert_eq!(entry_title(&make_entry("My Thread")).as_ref(), "My Thread");
+        assert_eq!(entry_title(&make_entry("")).as_ref(), "New Thread");
+        assert_eq!(entry_title(&make_entry("   ")).as_ref(), "New Thread");
+        assert_eq!(
+            entry_title(&make_entry("  Trimmed Title  ")).as_ref(),
+            "  Trimmed Title  "
+        );
+    }
+
+    #[test]
+    fn test_build_bucketed_items_inserts_separators() {
+        let today = Local::now();
+        let yesterday = today - TimeDelta::days(1);
+
+        let threads = vec![
+            SavedTextThreadMetadata {
+                title: "Thread 1".into(),
+                path: Arc::from(Path::new("/test/1.json")),
+                mtime: today,
             },
-            AgentSessionInfo {
-                session_id: acp::SessionId::new("today-1"),
-                cwd: None,
-                title: Some("Today 1".into()),
-                updated_at: Some(Utc.with_ymd_and_hms(2099, 1, 2, 12, 0, 0).unwrap()),
-                meta: None,
+            SavedTextThreadMetadata {
+                title: "Thread 2".into(),
+                path: Arc::from(Path::new("/test/2.json")),
+                mtime: today,
             },
-            AgentSessionInfo {
-                session_id: acp::SessionId::new("today-2"),
-                cwd: None,
-                title: Some("Today 2".into()),
-                updated_at: Some(Utc.with_ymd_and_hms(2099, 1, 2, 10, 0, 0).unwrap()),
-                meta: None,
+            SavedTextThreadMetadata {
+                title: "Thread 3".into(),
+                path: Arc::from(Path::new("/test/3.json")),
+                mtime: yesterday,
             },
         ];
 
-        let items = build_bucketed_items(sessions);
+        let items = build_bucketed_items(threads);
 
-        // The item with no updated_at should be skipped.
+        // Should have: Today separator, Thread 1, Thread 2, Yesterday separator, Thread 3
+        assert_eq!(items.len(), 5);
+
+        assert!(matches!(
+            &items[0],
+            ListItemType::BucketSeparator(TimeBucket::Today)
+        ));
         assert!(
-            !items.iter().any(|item| {
-                item.session()
-                    .is_some_and(|s| s.session_id == acp::SessionId::new("no-updated-at"))
-            }),
-            "sessions missing updated_at should not be rendered in bucketed view"
+            matches!(&items[1], ListItemType::Entry { entry, .. } if entry.title == "Thread 1")
         );
-
-        // We should have exactly 1 bucket separator for today's sessions.
-        let bucket_separators = items
-            .iter()
-            .filter(|item| matches!(item, ListItemType::BucketSeparator(_)))
-            .count();
-        assert_eq!(bucket_separators, 1);
-
-        // And 2 entries.
-        let entry_count = items
-            .iter()
-            .filter(|item| matches!(item, ListItemType::Entry { .. }))
-            .count();
-        assert_eq!(entry_count, 2);
+        assert!(
+            matches!(&items[2], ListItemType::Entry { entry, .. } if entry.title == "Thread 2")
+        );
+        assert!(matches!(
+            &items[3],
+            ListItemType::BucketSeparator(TimeBucket::Yesterday)
+        ));
+        assert!(
+            matches!(&items[4], ListItemType::Entry { entry, .. } if entry.title == "Thread 3")
+        );
     }
 
     #[test]
-    fn test_session_title_fallback_and_trimming() {
-        let session_empty = AgentSessionInfo {
-            session_id: acp::SessionId::new("empty"),
-            cwd: None,
-            title: Some("   ".into()),
-            updated_at: Some(Utc.with_ymd_and_hms(2099, 1, 1, 0, 0, 0).unwrap()),
-            meta: None,
-        };
-        assert_eq!(session_title(&session_empty).as_ref(), "New Thread");
+    fn test_build_bucketed_items_empty_input() {
+        let items = build_bucketed_items(vec![]);
+        assert!(items.is_empty());
+    }
 
-        let session_none = AgentSessionInfo {
-            session_id: acp::SessionId::new("none"),
-            cwd: None,
-            title: None,
-            updated_at: Some(Utc.with_ymd_and_hms(2099, 1, 1, 0, 0, 0).unwrap()),
-            meta: None,
-        };
-        assert_eq!(session_title(&session_none).as_ref(), "New Thread");
+    #[gpui::test]
+    async fn test_build_search_items_fuzzy_matching(cx: &mut gpui::TestAppContext) {
+        let threads = vec![
+            SavedTextThreadMetadata {
+                title: "Implement user authentication".to_string().into(),
+                path: Arc::from(Path::new("/test/1.json")),
+                mtime: Local::now(),
+            },
+            SavedTextThreadMetadata {
+                title: "Fix database connection".to_string().into(),
+                path: Arc::from(Path::new("/test/2.json")),
+                mtime: Local::now(),
+            },
+            SavedTextThreadMetadata {
+                title: "Add user profile page".to_string().into(),
+                path: Arc::from(Path::new("/test/3.json")),
+                mtime: Local::now(),
+            },
+            SavedTextThreadMetadata {
+                title: "Refactor authentication module".to_string().into(),
+                path: Arc::from(Path::new("/test/4.json")),
+                mtime: Local::now(),
+            },
+        ];
 
-        let session_title_ok = AgentSessionInfo {
-            session_id: acp::SessionId::new("ok"),
-            cwd: None,
-            title: Some("Hello".into()),
-            updated_at: Some(Utc.with_ymd_and_hms(2099, 1, 1, 0, 0, 0).unwrap()),
-            meta: None,
-        };
-        assert_eq!(session_title(&session_title_ok).as_ref(), "Hello");
+        let executor = cx.executor();
+
+        // Search for "auth" - should match threads with "authentication"
+        let items = build_search_items(threads.clone(), "auth".into(), executor.clone()).await;
+        assert_eq!(items.len(), 2);
+
+        // Verify both auth-related threads are found
+        let titles: Vec<_> = items
+            .iter()
+            .filter_map(|item| item.entry().map(|e| e.title.as_ref()))
+            .collect();
+        assert!(titles.contains(&"Implement user authentication"));
+        assert!(titles.contains(&"Refactor authentication module"));
+
+        // Verify search results have highlight positions
+        for item in &items {
+            if let ListItemType::SearchResult { positions, .. } = item {
+                assert!(
+                    !positions.is_empty(),
+                    "Search results should have highlight positions"
+                );
+            } else {
+                panic!("Expected SearchResult variant");
+            }
+        }
+
+        // Search for "user" - should match threads with "user"
+        let items = build_search_items(threads.clone(), "user".into(), executor.clone()).await;
+        assert_eq!(items.len(), 2);
+
+        // Search with no matches
+        let items = build_search_items(threads, "xyz123".into(), executor).await;
+        assert!(items.is_empty());
+
+        // Note: Empty query case is handled by the caller (update_visible_items)
+        // which routes to build_bucketed_items instead of build_search_items
     }
 }

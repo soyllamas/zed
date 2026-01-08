@@ -222,7 +222,6 @@ impl LanguageModels {
 pub struct NativeAgent {
     /// Session ID -> Session mapping
     sessions: HashMap<acp::SessionId, Session>,
-    history: Entity<HistoryStore>,
     /// Shared project context for all threads
     project_context: Entity<ProjectContext>,
     project_context_needs_refresh: watch::Sender<()>,
@@ -241,7 +240,6 @@ pub struct NativeAgent {
 impl NativeAgent {
     pub async fn new(
         project: Entity<Project>,
-        history: Entity<HistoryStore>,
         templates: Arc<Templates>,
         prompt_store: Option<Entity<PromptStore>>,
         fs: Arc<dyn Fs>,
@@ -281,7 +279,6 @@ impl NativeAgent {
                 watch::channel(());
             Self {
                 sessions: HashMap::default(),
-                history,
                 project_context: cx.new(|_| project_context),
                 project_context_needs_refresh: project_context_needs_refresh_tx,
                 _maintain_project_context: cx.spawn(async move |this, cx| {
@@ -806,14 +803,12 @@ impl NativeAgent {
         let Some(session) = self.sessions.get_mut(&id) else {
             return;
         };
-        let history = self.history.clone();
-        session.pending_save = cx.spawn(async move |_, cx| {
+        session.pending_save = cx.spawn(async move |_, _cx| {
             let Some(database) = database_future.await.map_err(|err| anyhow!(err)).log_err() else {
                 return;
             };
             let db_thread = db_thread.await;
             database.save_thread(id, db_thread).await.log_err();
-            history.update(cx, |history, cx| history.reload(cx));
         });
     }
 
@@ -1220,6 +1215,12 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
         Task::ready(Ok(()))
     }
 
+    fn session_list(&self, cx: &mut App) -> Option<Rc<dyn acp_thread::AgentSessionList>> {
+        Some(Rc::new(NativeAgentSessionList {
+            database_connection: ThreadsDatabase::connect(cx),
+        }) as Rc<dyn acp_thread::AgentSessionList>)
+    }
+
     fn model_selector(&self, session_id: &acp::SessionId) -> Option<Rc<dyn AgentModelSelector>> {
         Some(Rc::new(NativeAgentModelSelector {
             session_id: session_id.clone(),
@@ -1362,6 +1363,101 @@ impl acp_thread::AgentTelemetry for NativeAgentConnection {
         let task = session.thread.read(cx).to_db(cx);
         cx.background_spawn(async move {
             serde_json::to_value(task.await).context("Failed to serialize thread")
+        })
+    }
+}
+
+struct NativeAgentSessionList {
+    database_connection: Shared<Task<Result<Arc<ThreadsDatabase>, Arc<anyhow::Error>>>>,
+}
+
+impl acp_thread::AgentSessionList for NativeAgentSessionList {
+    fn supports_delete(&self) -> bool {
+        true
+    }
+
+    fn list(
+        &self,
+        _params: acp_thread::SessionListParams,
+        cx: &mut App,
+    ) -> Task<Result<acp_thread::SessionListResult>> {
+        let database_connection = self.database_connection.clone();
+        cx.spawn(async move |_| {
+            let database = database_connection.await.map_err(|err| anyhow!(err))?;
+            let threads = database.list_threads().await?;
+
+            let sessions = threads
+                .into_iter()
+                .map(|metadata| {
+                    let title = metadata.title.trim();
+                    acp_thread::AgentSessionInfo {
+                        session_id: metadata.id,
+                        cwd: None,
+                        title: if title.is_empty() {
+                            None
+                        } else {
+                            Some(metadata.title)
+                        },
+                        updated_at: Some(metadata.updated_at),
+                        meta: None,
+                    }
+                })
+                .collect();
+
+            Ok(acp_thread::SessionListResult {
+                sessions,
+                next_cursor: None,
+            })
+        })
+    }
+
+    fn delete_session(
+        &self,
+        session_id: &acp::SessionId,
+        _cx: &mut App,
+    ) -> Option<Rc<dyn acp_thread::AgentSessionDelete>> {
+        Some(Rc::new(NativeAgentSessionDelete {
+            database_connection: self.database_connection.clone(),
+            session_id: session_id.clone(),
+        }) as Rc<dyn acp_thread::AgentSessionDelete>)
+    }
+
+    fn delete_all_sessions(
+        &self,
+        _cx: &mut App,
+    ) -> Option<Rc<dyn acp_thread::AgentSessionDeleteAll>> {
+        Some(Rc::new(NativeAgentDeleteAllSessions {
+            database_connection: self.database_connection.clone(),
+        }) as Rc<dyn acp_thread::AgentSessionDeleteAll>)
+    }
+}
+
+struct NativeAgentSessionDelete {
+    database_connection: Shared<Task<Result<Arc<ThreadsDatabase>, Arc<anyhow::Error>>>>,
+    session_id: acp::SessionId,
+}
+
+impl acp_thread::AgentSessionDelete for NativeAgentSessionDelete {
+    fn run(&self, cx: &mut App) -> Task<Result<()>> {
+        let database_connection = self.database_connection.clone();
+        let session_id = self.session_id.clone();
+        cx.spawn(async move |_| {
+            let database = database_connection.await.map_err(|err| anyhow!(err))?;
+            database.delete_thread(session_id).await
+        })
+    }
+}
+
+struct NativeAgentDeleteAllSessions {
+    database_connection: Shared<Task<Result<Arc<ThreadsDatabase>, Arc<anyhow::Error>>>>,
+}
+
+impl acp_thread::AgentSessionDeleteAll for NativeAgentDeleteAllSessions {
+    fn run(&self, cx: &mut App) -> Task<Result<()>> {
+        let database_connection = self.database_connection.clone();
+        cx.spawn(async move |_| {
+            let database = database_connection.await.map_err(|err| anyhow!(err))?;
+            database.delete_threads().await
         })
     }
 }
@@ -1523,12 +1619,8 @@ mod internal_tests {
         )
         .await;
         let project = Project::test(fs.clone(), [], cx).await;
-        let text_thread_store =
-            cx.new(|cx| assistant_text_thread::TextThreadStore::fake(project.clone(), cx));
-        let history_store = cx.new(|cx| HistoryStore::new(text_thread_store, cx));
         let agent = NativeAgent::new(
             project.clone(),
-            history_store,
             Templates::new(),
             None,
             fs.clone(),
@@ -1585,13 +1677,9 @@ mod internal_tests {
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree("/", json!({ "a": {}  })).await;
         let project = Project::test(fs.clone(), [], cx).await;
-        let text_thread_store =
-            cx.new(|cx| assistant_text_thread::TextThreadStore::fake(project.clone(), cx));
-        let history_store = cx.new(|cx| HistoryStore::new(text_thread_store, cx));
         let connection = NativeAgentConnection(
             NativeAgent::new(
                 project.clone(),
-                history_store,
                 Templates::new(),
                 None,
                 fs.clone(),
@@ -1663,14 +1751,9 @@ mod internal_tests {
         .await;
         let project = Project::test(fs.clone(), [], cx).await;
 
-        let text_thread_store =
-            cx.new(|cx| assistant_text_thread::TextThreadStore::fake(project.clone(), cx));
-        let history_store = cx.new(|cx| HistoryStore::new(text_thread_store, cx));
-
         // Create the agent and connection
         let agent = NativeAgent::new(
             project.clone(),
-            history_store,
             Templates::new(),
             None,
             fs.clone(),
@@ -1741,7 +1824,6 @@ mod internal_tests {
         let history_store = cx.new(|cx| HistoryStore::new(text_thread_store, cx));
         let agent = NativeAgent::new(
             project.clone(),
-            history_store.clone(),
             Templates::new(),
             None,
             fs.clone(),

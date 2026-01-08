@@ -1,7 +1,9 @@
 use std::{ops::Range, path::Path, rc::Rc, sync::Arc, time::Duration};
 
+use acp_thread::{AgentSessionInfo, AgentSessionList, SessionListParams};
+
 use acp_thread::AcpThread;
-use agent::{ContextServerRegistry, DbThreadMetadata, HistoryEntry, HistoryStore};
+use agent::{ContextServerRegistry, DbThreadMetadata};
 use agent_servers::AgentServer;
 use db::kvp::{Dismissable, KEY_VALUE_STORE};
 use project::{
@@ -29,7 +31,10 @@ use crate::{
 };
 use crate::{
     ExpandMessageEditor,
-    acp::{AcpThreadHistory, ThreadHistoryEvent},
+    acp::{
+        AcpThreadHistory, AcpThreadViewEvent, TextThreadHistory, TextThreadHistoryEvent,
+        ThreadHistoryEvent,
+    },
 };
 use crate::{ExternalAgent, NewExternalAgentThread, NewNativeAgentThreadFromSummary};
 use agent_settings::AgentSettings;
@@ -57,8 +62,8 @@ use search::{BufferSearchBar, buffer_search};
 use settings::{Settings, update_settings_file};
 use theme::ThemeSettings;
 use ui::{
-    Callout, ContextMenu, ContextMenuEntry, KeyBinding, PopoverMenu, PopoverMenuHandle,
-    ProgressBar, Tab, Tooltip, prelude::*, utils::WithRemSize,
+    Callout, ContextMenu, ContextMenuEntry, IconButtonShape, KeyBinding, ListItem, ListItemSpacing,
+    PopoverMenu, PopoverMenuHandle, ProgressBar, Tab, Tooltip, prelude::*, utils::WithRemSize,
 };
 use util::ResultExt as _;
 use workspace::{
@@ -74,6 +79,39 @@ use zed_actions::{
 };
 
 const AGENT_PANEL_KEY: &str = "agent_panel";
+
+/// Shared container for agent sessions with visibility-based access control.
+/// - Write methods are private (only `AgentPanel` in this module can update)
+/// - Read methods are public (consumers like inline assist can read)
+#[derive(Clone)]
+pub struct AgentSessions {
+    inner: Arc<parking_lot::Mutex<Vec<AgentSessionInfo>>>,
+}
+
+impl AgentSessions {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(parking_lot::Mutex::new(Vec::new())),
+        }
+    }
+
+    fn update(&self, sessions: Vec<AgentSessionInfo>) {
+        *self.inner.lock() = sessions;
+    }
+
+    fn clear(&self) {
+        self.inner.lock().clear();
+    }
+
+    fn is_empty(&self) -> bool {
+        self.inner.lock().is_empty()
+    }
+
+    /// Returns a snapshot of the current sessions.
+    pub fn get(&self) -> Vec<AgentSessionInfo> {
+        self.inner.lock().clone()
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug)]
 struct SerializedAgentPanel {
@@ -209,6 +247,12 @@ pub fn init(cx: &mut App) {
     .detach();
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NavigationMode {
+    AgentSessions,
+    TextThreads,
+}
+
 enum ActiveView {
     ExternalAgentThread {
         thread_view: Entity<AcpThreadView>,
@@ -219,7 +263,8 @@ enum ActiveView {
         buffer_search_bar: Entity<BufferSearchBar>,
         _subscriptions: Vec<gpui::Subscription>,
     },
-    History,
+    HistoryAgent,
+    HistoryText,
     Configuration,
 }
 
@@ -280,10 +325,10 @@ impl From<ExternalAgent> for AgentType {
 impl ActiveView {
     pub fn which_font_size_used(&self) -> WhichFontSize {
         match self {
-            ActiveView::ExternalAgentThread { .. } | ActiveView::History => {
+            ActiveView::ExternalAgentThread { .. } | ActiveView::HistoryAgent => {
                 WhichFontSize::AgentFont
             }
-            ActiveView::TextThread { .. } => WhichFontSize::BufferFont,
+            ActiveView::TextThread { .. } | ActiveView::HistoryText => WhichFontSize::BufferFont,
             ActiveView::Configuration => WhichFontSize::None,
         }
     }
@@ -291,7 +336,6 @@ impl ActiveView {
     fn native_agent(
         fs: Arc<dyn Fs>,
         prompt_store: Option<Entity<PromptStore>>,
-        history_store: Entity<agent::HistoryStore>,
         project: Entity<Project>,
         workspace: WeakEntity<Workspace>,
         window: &mut Window,
@@ -299,13 +343,13 @@ impl ActiveView {
     ) -> Self {
         let thread_view = cx.new(|cx| {
             crate::acp::AcpThreadView::new(
-                ExternalAgent::NativeAgent.server(fs, history_store.clone()),
+                ExternalAgent::NativeAgent.server(fs),
                 None,
                 None,
                 workspace,
                 project,
-                history_store,
                 prompt_store,
+                None,
                 false,
                 window,
                 cx,
@@ -317,7 +361,6 @@ impl ActiveView {
 
     pub fn text_thread(
         text_thread_editor: Entity<TextThreadEditor>,
-        acp_history_store: Entity<agent::HistoryStore>,
         language_registry: Arc<LanguageRegistry>,
         window: &mut Window,
         cx: &mut App,
@@ -383,18 +426,8 @@ impl ActiveView {
                             editor.set_text(summary, window, cx);
                         })
                     }
-                    TextThreadEvent::PathChanged { old_path, new_path } => {
-                        acp_history_store.update(cx, |history_store, cx| {
-                            if let Some(old_path) = old_path {
-                                history_store
-                                    .replace_recently_opened_text_thread(old_path, new_path, cx);
-                            } else {
-                                history_store.push_recently_opened_entry(
-                                    agent::HistoryEntryId::TextThread(new_path.clone()),
-                                    cx,
-                                );
-                            }
-                        });
+                    TextThreadEvent::PathChanged { .. } => {
+                        // Previously tracked "recently opened" - now handled by sorting by mtime
                     }
                     _ => {}
                 }
@@ -424,9 +457,17 @@ pub struct AgentPanel {
     fs: Arc<dyn Fs>,
     language_registry: Arc<LanguageRegistry>,
     acp_history: Entity<AcpThreadHistory>,
-    history_store: Entity<agent::HistoryStore>,
+
     text_thread_store: Entity<assistant_text_thread::TextThreadStore>,
     prompt_store: Option<Entity<PromptStore>>,
+    text_history: Entity<TextThreadHistory>,
+
+    // Connection-backed agent session snapshot (unified ordering for Recent, navigation menu, and History).
+    agent_session_list: Option<Rc<dyn AgentSessionList>>,
+    agent_sessions: AgentSessions,
+    agent_delete_supported: bool,
+    agent_delete_all_supported: bool,
+    _agent_sessions_refresh_task: Task<()>,
     context_server_registry: Entity<ContextServerRegistry>,
     configuration: Option<Entity<AgentConfiguration>>,
     configuration_subscription: Option<Subscription>,
@@ -444,6 +485,7 @@ pub struct AgentPanel {
     onboarding: Entity<AgentPanelOnboarding>,
     selected_agent: AgentType,
     show_trust_workspace_message: bool,
+    _thread_view_subscription: Option<Subscription>,
 }
 
 impl AgentPanel {
@@ -543,23 +585,73 @@ impl AgentPanel {
         let context_server_registry =
             cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
 
-        let history_store = cx.new(|cx| agent::HistoryStore::new(text_thread_store.clone(), cx));
-        let acp_history = cx.new(|cx| AcpThreadHistory::new(history_store.clone(), window, cx));
+        // ACP session history is sourced via an AgentConnection `session_list` provider.
+        // Until we have an active ACP thread/connection (or if the connection doesn't support it),
+        // we initialize with an empty provider.
+        let acp_history =
+            cx.new(|cx| AcpThreadHistory::new(Rc::new(acp_thread::EmptySessionList), window, cx));
+
+        let text_history =
+            cx.new(|cx| TextThreadHistory::new(text_thread_store.downgrade(), window, cx));
+
         cx.subscribe_in(
             &acp_history,
             window,
             |this, _, event, window, cx| match event {
-                ThreadHistoryEvent::Open(HistoryEntry::AcpThread(thread)) => {
-                    this.external_thread(
-                        Some(crate::ExternalAgent::NativeAgent),
-                        Some(thread.clone()),
-                        None,
+                ThreadHistoryEvent::OpenSession(session_id) => {
+                    // Use the active thread's connection to resume the selected session.
+                    // If we don't have an active thread yet, there's nothing to resume through.
+                    let Some(thread_view) = this.active_thread_view().cloned() else {
+                        return;
+                    };
+                    let Some(thread) = thread_view.read(cx).thread().cloned() else {
+                        return;
+                    };
+
+                    let connection = thread.read(cx).connection().clone();
+                    let Some(resumer) = connection.resume(&session_id, cx) else {
+                        return;
+                    };
+
+                    // Switch back to the thread view and rely on `resume` to load the session.
+                    // We intentionally avoid fabricating placeholder `DbThreadMetadata` here.
+                    this.set_active_view(
+                        ActiveView::ExternalAgentThread { thread_view },
+                        true,
                         window,
                         cx,
                     );
+
+                    // Create the resume task in this synchronous context, then refresh the agent
+                    // session snapshot after it completes.
+                    let resume_task = resumer.run(cx);
+                    let panel = cx.weak_entity();
+                    cx.spawn_in(window, async move |_, cx| {
+                        if let Err(err) = resume_task.await {
+                            log::error!("Failed to resume agent session from history: {err:?}");
+                            return;
+                        }
+
+                        if let Some(panel) = panel.upgrade() {
+                            panel.update(cx, |panel, cx| {
+                                panel.refresh_agent_session_snapshot(cx);
+                            });
+                        }
+                    })
+                    .detach();
+
+                    cx.notify();
                 }
-                ThreadHistoryEvent::Open(HistoryEntry::TextThread(thread)) => {
-                    this.open_saved_text_thread(thread.path.clone(), window, cx)
+            },
+        )
+        .detach();
+
+        cx.subscribe_in(
+            &text_history,
+            window,
+            |this, _, event, window, cx| match event {
+                TextThreadHistoryEvent::OpenTextThread(path) => {
+                    this.open_saved_text_thread(path.clone(), window, cx)
                         .detach_and_log_err(cx);
                 }
             },
@@ -571,7 +663,6 @@ impl AgentPanel {
             DefaultView::Thread => ActiveView::native_agent(
                 fs.clone(),
                 prompt_store.clone(),
-                history_store.clone(),
                 project.clone(),
                 workspace.clone(),
                 window,
@@ -593,13 +684,7 @@ impl AgentPanel {
                     editor.insert_default_prompt(window, cx);
                     editor
                 });
-                ActiveView::text_thread(
-                    text_thread_editor,
-                    history_store.clone(),
-                    language_registry.clone(),
-                    window,
-                    cx,
-                )
+                ActiveView::text_thread(text_thread_editor, language_registry.clone(), window, cx)
             }
         };
 
@@ -636,7 +721,7 @@ impl AgentPanel {
                     .detach();
                     panel.agent_navigation_menu = Some(agent_navigation_menu);
                 })
-                .ok();
+                .log_err();
         });
 
         let onboarding = cx.new(|cx| {
@@ -691,10 +776,18 @@ impl AgentPanel {
             pending_serialization: None,
             onboarding,
             acp_history,
-            history_store,
+
+            text_history,
             selected_agent: AgentType::default(),
             loading: false,
             show_trust_workspace_message: false,
+
+            agent_session_list: None,
+            agent_sessions: AgentSessions::new(),
+            agent_delete_supported: false,
+            agent_delete_all_supported: false,
+            _agent_sessions_refresh_task: Task::ready(()),
+            _thread_view_subscription: None,
         };
 
         // Initial sync of agent servers from extensions
@@ -720,8 +813,8 @@ impl AgentPanel {
         &self.prompt_store
     }
 
-    pub fn thread_store(&self) -> &Entity<HistoryStore> {
-        &self.history_store
+    pub(crate) fn agent_sessions(&self) -> AgentSessions {
+        self.agent_sessions.clone()
     }
 
     pub fn open_thread(
@@ -765,7 +858,10 @@ impl AgentPanel {
     fn active_thread_view(&self) -> Option<&Entity<AcpThreadView>> {
         match &self.active_view {
             ActiveView::ExternalAgentThread { thread_view, .. } => Some(thread_view),
-            ActiveView::TextThread { .. } | ActiveView::History | ActiveView::Configuration => None,
+            ActiveView::TextThread { .. }
+            | ActiveView::HistoryAgent
+            | ActiveView::HistoryText
+            | ActiveView::Configuration => None,
         }
     }
 
@@ -779,18 +875,24 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(thread) = self
-            .history_store
-            .read(cx)
-            .thread_from_session_id(&action.from_session_id)
+        let sessions = self.agent_sessions.get();
+        let Some(session) = sessions
+            .iter()
+            .find(|s| s.session_id == action.from_session_id)
         else {
             return;
+        };
+
+        let thread = DbThreadMetadata {
+            id: session.session_id.clone(),
+            title: session.title.clone().unwrap_or_else(|| "New Thread".into()),
+            updated_at: session.updated_at.unwrap_or_else(chrono::Utc::now),
         };
 
         self.external_thread(
             Some(ExternalAgent::NativeAgent),
             None,
-            Some(thread.clone()),
+            Some(thread),
             window,
             cx,
         );
@@ -828,7 +930,6 @@ impl AgentPanel {
         self.set_active_view(
             ActiveView::text_thread(
                 text_thread_editor.clone(),
-                self.history_store.clone(),
                 self.language_registry.clone(),
                 window,
                 cx,
@@ -861,7 +962,6 @@ impl AgentPanel {
         }
 
         let loading = self.loading;
-        let history = self.history_store.clone();
 
         cx.spawn_in(window, async move |this, cx| {
             let ext_agent = match agent_choice {
@@ -902,7 +1002,7 @@ impl AgentPanel {
                 }
             };
 
-            let server = ext_agent.server(fs, history);
+            let server = ext_agent.server(fs);
             this.update_in(cx, |agent_panel, window, cx| {
                 agent_panel._external_thread(
                     server,
@@ -956,14 +1056,274 @@ impl AgentPanel {
     }
 
     fn open_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if matches!(self.active_view, ActiveView::History) {
+        // Toggling behavior: if we're already in a history view, go back.
+        if matches!(
+            self.active_view,
+            ActiveView::HistoryAgent | ActiveView::HistoryText
+        ) {
             if let Some(previous_view) = self.previous_view.take() {
                 self.set_active_view(previous_view, true, window, cx);
             }
-        } else {
-            self.set_active_view(ActiveView::History, true, window, cx);
+            cx.notify();
+            return;
         }
+
+        // Route "History" based on the current mode.
+        //
+        // - If the user is in the text thread view, open the text thread history.
+        // - Otherwise, open the agent session history (if supported by the active connection).
+        match self.active_view {
+            ActiveView::TextThread { .. } => {
+                self.set_active_view(ActiveView::HistoryText, true, window, cx);
+                cx.notify();
+                return;
+            }
+            _ => {}
+        }
+
+        // Agent session history: requires an active ACP thread connection with `session_list`.
+        let Some(thread_view) = self.active_thread_view().cloned() else {
+            return;
+        };
+        let Some(thread) = thread_view.read(cx).thread().cloned() else {
+            return;
+        };
+        let connection = thread.read(cx).connection().clone();
+        let Some(session_list) = connection.session_list(cx) else {
+            return;
+        };
+
+        // Install the provider into the shared snapshot so "Recent", the navigation menu, and
+        // the history view all share the same ordering and capabilities.
+        //
+        // Avoid redundant refreshes: if we already have this provider installed and the snapshot
+        // is non-empty, keep the existing snapshot; otherwise refresh it now so History is warm.
+        let should_refresh_snapshot = self.agent_session_list.as_ref().map_or(true, |existing| {
+            !Rc::ptr_eq(existing, &session_list) || self.agent_sessions.is_empty()
+        });
+
+        self.set_agent_session_list_provider(session_list.clone(), cx);
+        if should_refresh_snapshot {
+            self.refresh_agent_session_snapshot(cx);
+        }
+
+        // Ensure the history view uses the same provider instance.
+        self.acp_history.update(cx, |history, cx| {
+            history.set_session_list(session_list, cx);
+        });
+
+        self.set_active_view(ActiveView::HistoryAgent, true, window, cx);
         cx.notify();
+    }
+
+    pub(crate) fn refresh_acp_history_if_visible(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.active_view, ActiveView::HistoryAgent) {
+            return;
+        }
+
+        // When agent session history is visible, it must stay in sync with connection-backed operations
+        // (e.g. deletes initiated from the Recent list).
+        self.acp_history.update(cx, |history, cx| {
+            history.refresh(cx);
+        });
+    }
+
+    fn render_text_thread_history(&self) -> AnyElement {
+        self.text_history.clone().into_any_element()
+    }
+
+    fn render_agent_session_recent_list(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        // Only render in agent-session mode, and only when we have a provider-backed snapshot.
+        if self.navigation_mode() != NavigationMode::AgentSessions {
+            return v_flex().size_full().into_any();
+        }
+
+        if self.agent_sessions.is_empty() {
+            return v_flex().size_full().into_any();
+        }
+
+        let delete_supported = self.agent_delete_supported;
+        let provider = self.agent_session_list.clone();
+        let panel = cx.weak_entity();
+
+        v_flex()
+            .size_full()
+            .justify_end()
+            .child(
+                v_flex()
+                    .child(
+                        div().pl_1().pr_1p5().child(
+                            h_flex()
+                                .mt_2()
+                                .pl_1p5()
+                                .pb_1()
+                                .w_full()
+                                .justify_between()
+                                .border_b_1()
+                                .border_color(cx.theme().colors().border_variant)
+                                .child(
+                                    Label::new("Recent")
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                )
+                                .child(
+                                    Button::new("view-history", "View All")
+                                        .style(ButtonStyle::Subtle)
+                                        .label_size(LabelSize::Small)
+                                        .on_click(move |_event, window, cx| {
+                                            window.dispatch_action(OpenHistory.boxed_clone(), cx);
+                                        }),
+                                ),
+                        ),
+                    )
+                    .child(v_flex().p_1().pr_1p5().gap_1().children(
+                        self.agent_sessions
+                            .get()
+                            .into_iter()
+                            .take(3)
+                            .enumerate()
+                            .map(|(index, session)| {
+                                let title = session.display_title();
+
+                                let formatted_time = session
+                                    .updated_at
+                                    .map(|timestamp| {
+                                        let now = chrono::Utc::now();
+                                        let duration = now.signed_duration_since(timestamp);
+
+                                        if duration.num_days() > 0 {
+                                            format!("{}d", duration.num_days())
+                                        } else if duration.num_hours() > 0 {
+                                            format!("{}h ago", duration.num_hours())
+                                        } else if duration.num_minutes() > 0 {
+                                            format!("{}m ago", duration.num_minutes())
+                                        } else {
+                                            "Just now".to_string()
+                                        }
+                                    })
+                                    .unwrap_or_default();
+
+                                let session_id = session.session_id;
+
+                                ListItem::new(index)
+                                    .rounded()
+                                    .spacing(ListItemSpacing::Sparse)
+                                    .start_slot(
+                                        h_flex()
+                                            .w_full()
+                                            .gap_2()
+                                            .justify_between()
+                                            .child(
+                                                Label::new(title)
+                                                    .size(LabelSize::Small)
+                                                    .truncate(),
+                                            )
+                                            .when(!formatted_time.is_empty(), |this| {
+                                                this.child(
+                                                    Label::new(formatted_time)
+                                                        .color(Color::Muted)
+                                                        .size(LabelSize::XSmall),
+                                                )
+                                            }),
+                                    )
+                                    .end_slot::<IconButton>(if delete_supported {
+                                        Some(
+                                            IconButton::new("delete", IconName::Trash)
+                                                .shape(IconButtonShape::Square)
+                                                .icon_size(IconSize::XSmall)
+                                                .icon_color(Color::Muted)
+                                                .on_click({
+                                                    let provider = provider.clone();
+                                                    let panel = panel.clone();
+                                                    let session_id = session_id.clone();
+                                                    move |_event, _window, cx| {
+                                                        cx.stop_propagation();
+
+                                                        let Some(provider) = provider.clone()
+                                                        else {
+                                                            return;
+                                                        };
+                                                        let Some(deleter) = provider
+                                                            .delete_session(&session_id, cx)
+                                                        else {
+                                                            return;
+                                                        };
+
+                                                        let delete_task = deleter.run(cx);
+                                                        let panel = panel.clone();
+                                                        cx.spawn(async move |cx| {
+                                                            if let Err(err) = delete_task.await {
+                                                                log::error!("Failed to delete session from recent list: {err:?}");
+                                                                return;
+                                                            }
+
+                                                            if let Some(panel) = panel.upgrade() {
+                                                                panel
+                                                                    .update(cx, |panel, cx| {
+                                                                        panel.refresh_agent_session_snapshot(cx);
+                                                                    });
+                                                            }
+                                                        })
+                                                        .detach();
+                                                    }
+                                                }),
+                                        )
+                                    } else {
+                                        None
+                                    })
+                                    .on_click({
+                                        let panel = panel.clone();
+                                        move |_event, _window, cx| {
+                                            let Some(panel) = panel.upgrade() else {
+                                                return;
+                                            };
+
+                                            let Some(thread_view) =
+                                                panel.read(cx).active_thread_view().cloned()
+                                            else {
+                                                return;
+                                            };
+                                            let Some(thread) =
+                                                thread_view.read(cx).thread().cloned()
+                                            else {
+                                                return;
+                                            };
+
+                                            let connection = thread.read(cx).connection().clone();
+                                            let Some(resumer) =
+                                                connection.resume(&session_id, cx)
+                                            else {
+                                                return;
+                                            };
+
+                                            // Create task in sync context; refresh snapshot after completion.
+                                            let resume_task = resumer.run(cx);
+                                            let panel = panel.downgrade();
+                                            cx.spawn(async move |cx| {
+                                                if let Err(err) = resume_task.await {
+                                                    log::error!("Failed to resume agent session from recent list: {err:?}");
+                                                    return;
+                                                }
+
+                                                if let Some(panel) = panel.upgrade() {
+                                                    panel
+                                                        .update(cx, |panel, cx| {
+                                                            panel.refresh_agent_session_snapshot(cx);
+                                                        });
+                                                }
+                                            })
+                                            .detach();
+                                        }
+                                    })
+                                    .into_any_element()
+                            }),
+                    )),
+            )
+            .into_any()
     }
 
     pub(crate) fn open_saved_text_thread(
@@ -973,8 +1333,8 @@ impl AgentPanel {
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
         let text_thread_task = self
-            .history_store
-            .update(cx, |store, cx| store.load_text_thread(path, cx));
+            .text_thread_store
+            .update(cx, |store, cx| store.open_local(path, cx));
         cx.spawn_in(window, async move |this, cx| {
             let text_thread = text_thread_task.await?;
             this.update_in(cx, |this, window, cx| {
@@ -1010,13 +1370,7 @@ impl AgentPanel {
         }
 
         self.set_active_view(
-            ActiveView::text_thread(
-                editor,
-                self.history_store.clone(),
-                self.language_registry.clone(),
-                window,
-                cx,
-            ),
+            ActiveView::text_thread(editor, self.language_registry.clone(), window, cx),
             true,
             window,
             cx,
@@ -1025,7 +1379,7 @@ impl AgentPanel {
 
     pub fn go_back(&mut self, _: &workspace::GoBack, window: &mut Window, cx: &mut Context<Self>) {
         match self.active_view {
-            ActiveView::Configuration | ActiveView::History => {
+            ActiveView::Configuration | ActiveView::HistoryAgent | ActiveView::HistoryText => {
                 if let Some(previous_view) = self.previous_view.take() {
                     self.active_view = previous_view;
 
@@ -1038,7 +1392,9 @@ impl AgentPanel {
                         } => {
                             text_thread_editor.focus_handle(cx).focus(window, cx);
                         }
-                        ActiveView::History | ActiveView::Configuration => {}
+                        ActiveView::HistoryAgent
+                        | ActiveView::HistoryText
+                        | ActiveView::Configuration => {}
                     }
                 }
                 cx.notify();
@@ -1206,7 +1562,10 @@ impl AgentPanel {
                     })
                     .detach_and_log_err(cx);
             }
-            ActiveView::TextThread { .. } | ActiveView::History | ActiveView::Configuration => {}
+            ActiveView::TextThread { .. }
+            | ActiveView::HistoryAgent
+            | ActiveView::HistoryText
+            | ActiveView::Configuration => {}
         }
     }
 
@@ -1284,8 +1643,11 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let current_is_history = matches!(self.active_view, ActiveView::History);
-        let new_is_history = matches!(new_view, ActiveView::History);
+        let current_is_history = matches!(
+            self.active_view,
+            ActiveView::HistoryAgent | ActiveView::HistoryText
+        );
+        let new_is_history = matches!(new_view, ActiveView::HistoryAgent | ActiveView::HistoryText);
 
         let current_is_config = matches!(self.active_view, ActiveView::Configuration);
         let new_is_config = matches!(new_view, ActiveView::Configuration);
@@ -1294,18 +1656,57 @@ impl AgentPanel {
         let new_is_special = new_is_history || new_is_config;
 
         match &new_view {
-            ActiveView::TextThread {
-                text_thread_editor, ..
-            } => self.history_store.update(cx, |store, cx| {
-                if let Some(path) = text_thread_editor.read(cx).text_thread().read(cx).path() {
-                    store.push_recently_opened_entry(
-                        agent::HistoryEntryId::TextThread(path.clone()),
-                        cx,
-                    )
+            ActiveView::ExternalAgentThread { thread_view } => {
+                // Ensure the shared agent-session snapshot stays warm when switching into an agent thread view.
+                // This keeps the navigation menu + Recent list + History in sync without requiring the user to open History first.
+                if let Some(thread) = thread_view.read(cx).thread().cloned() {
+                    let connection = thread.read(cx).connection().clone();
+                    if let Some(provider) = connection.session_list(cx) {
+                        let should_refresh_snapshot =
+                            self.agent_session_list.as_ref().map_or(true, |existing| {
+                                !Rc::ptr_eq(existing, &provider) || self.agent_sessions.is_empty()
+                            });
+
+                        self.set_agent_session_list_provider(provider, cx);
+                        if should_refresh_snapshot {
+                            self.refresh_agent_session_snapshot(cx);
+                        }
+                    }
+                    // Thread is already ready; no need to subscribe to ThreadReady.
+                    self._thread_view_subscription = None;
+                } else {
+                    // Thread is still loading. Subscribe to refresh the snapshot once it becomes ready.
+                    self._thread_view_subscription = Some(cx.subscribe_in(
+                        thread_view,
+                        window,
+                        |this, thread_view, event, _window, cx| {
+                            if matches!(event, AcpThreadViewEvent::ThreadReady) {
+                                if let Some(thread) = thread_view.read(cx).thread().cloned() {
+                                    let connection = thread.read(cx).connection().clone();
+                                    if let Some(provider) = connection.session_list(cx) {
+                                        let should_refresh = this
+                                            .agent_session_list
+                                            .as_ref()
+                                            .map_or(true, |existing| {
+                                                !Rc::ptr_eq(existing, &provider)
+                                                    || this.agent_sessions.is_empty()
+                                            });
+
+                                        this.set_agent_session_list_provider(provider, cx);
+                                        if should_refresh {
+                                            this.refresh_agent_session_snapshot(cx);
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                    ));
                 }
-            }),
-            ActiveView::ExternalAgentThread { .. } => {}
-            ActiveView::History | ActiveView::Configuration => {}
+            }
+            ActiveView::TextThread { .. }
+            | ActiveView::HistoryAgent
+            | ActiveView::HistoryText
+            | ActiveView::Configuration => {}
         }
 
         if current_is_special && !new_is_special {
@@ -1329,66 +1730,133 @@ impl AgentPanel {
         panel: Entity<Self>,
         cx: &mut Context<ContextMenu>,
     ) -> ContextMenu {
-        let entries = panel
-            .read(cx)
-            .history_store
-            .read(cx)
-            .recently_opened_entries(cx);
+        let navigation_mode = panel.read(cx).navigation_mode();
 
-        if entries.is_empty() {
-            return menu;
+        match navigation_mode {
+            NavigationMode::AgentSessions => {
+                let sessions = panel.read(cx).agent_sessions.get();
+                if sessions.is_empty() {
+                    return menu;
+                }
+
+                menu = menu.header("Recently Opened");
+
+                for session in sessions.into_iter().take(10) {
+                    let title = session.display_title();
+
+                    menu = menu.entry_with_end_slot_on_hover(
+                        title,
+                        None,
+                        {
+                            let weak_panel = panel.downgrade();
+                            let session_id = session.session_id.clone();
+                            move |_window, cx| {
+                                let session_id = session_id.clone();
+
+                                // Clone the weak handle for the immediate `update` call, and use a
+                                // separate clone inside the `update` closure for the async refresh.
+                                let update_target = weak_panel.clone();
+                                let weak_panel_for_update = weak_panel.clone();
+
+                                update_target
+                                    .update(cx, move |this, cx| {
+                                        let Some(thread_view) = this.active_thread_view().cloned()
+                                        else {
+                                            return;
+                                        };
+                                        let Some(thread) = thread_view.read(cx).thread().cloned()
+                                        else {
+                                            return;
+                                        };
+
+                                        let connection = thread.read(cx).connection().clone();
+                                        let Some(resumer) = connection.resume(&session_id, cx)
+                                        else {
+                                            return;
+                                        };
+
+                                        // Create the resume task in this synchronous context. We
+                                        // intentionally don't fabricate placeholder metadata here.
+                                        let resume_task = resumer.run(cx);
+
+                                        let weak_panel = weak_panel_for_update.clone();
+                                        cx.spawn(async move |_, cx| {
+                                            if let Err(err) = resume_task.await {
+                                                log::error!(
+                                                    "Failed to resume agent session from navigation menu: {err:?}"
+                                                );
+                                                return;
+                                            }
+
+                                            if let Some(panel) = weak_panel.upgrade() {
+                                                panel.update(cx, |panel, cx| {
+                                                    panel.refresh_agent_session_snapshot(cx);
+                                                });
+                                            }
+                                        })
+                                        .detach();
+                                    })
+                                    .log_err();
+                            }
+                        },
+                        IconName::Close,
+                        "Close Entry".into(),
+                        {
+                            // For agent sessions, we don't have a dedicated "remove from menu"
+                            // persistence yet; deleting the session itself is handled elsewhere.
+                            move |_window, _cx| {}
+                        },
+                    );
+                }
+
+                menu.separator()
+            }
+            NavigationMode::TextThreads => {
+                let mut entries: Vec<_> = panel
+                    .read(cx)
+                    .text_thread_store
+                    .read(cx)
+                    .unordered_text_threads()
+                    .cloned()
+                    .collect();
+
+                // Sort by mtime descending (most recent first)
+                entries.sort_unstable_by(|a, b| b.mtime.cmp(&a.mtime));
+
+                // Take only the first few entries (matching agent sessions behavior)
+                let entries: Vec<_> = entries.into_iter().take(6).collect();
+
+                if entries.is_empty() {
+                    return menu;
+                }
+
+                menu = menu.header("Recent");
+
+                for entry in entries {
+                    let title = if entry.title.trim().is_empty() {
+                        SharedString::from("New Thread")
+                    } else {
+                        entry.title.clone()
+                    };
+
+                    menu = menu.entry(title, None, {
+                        let panel = panel.downgrade();
+                        let path = entry.path.clone();
+                        move |window, cx| {
+                            let path = path.clone();
+                            panel
+                                .update(cx, move |this, cx| {
+                                    this.open_saved_text_thread(path.clone(), window, cx)
+                                        .detach_and_log_err(cx);
+                                })
+                                .log_err();
+                        }
+                    });
+                }
+
+                menu.separator()
+            }
         }
-
-        menu = menu.header("Recently Opened");
-
-        for entry in entries {
-            let title = entry.title().clone();
-
-            menu = menu.entry_with_end_slot_on_hover(
-                title,
-                None,
-                {
-                    let panel = panel.downgrade();
-                    let entry = entry.clone();
-                    move |window, cx| {
-                        let entry = entry.clone();
-                        panel
-                            .update(cx, move |this, cx| match &entry {
-                                agent::HistoryEntry::AcpThread(entry) => this.external_thread(
-                                    Some(ExternalAgent::NativeAgent),
-                                    Some(entry.clone()),
-                                    None,
-                                    window,
-                                    cx,
-                                ),
-                                agent::HistoryEntry::TextThread(entry) => this
-                                    .open_saved_text_thread(entry.path.clone(), window, cx)
-                                    .detach_and_log_err(cx),
-                            })
-                            .ok();
-                    }
-                },
-                IconName::Close,
-                "Close Entry".into(),
-                {
-                    let panel = panel.downgrade();
-                    let id = entry.id();
-                    move |_window, cx| {
-                        panel
-                            .update(cx, |this, cx| {
-                                this.history_store.update(cx, |history_store, cx| {
-                                    history_store.remove_recently_opened_entry(&id, cx);
-                                });
-                            })
-                            .ok();
-                    }
-                },
-            );
-        }
-
-        menu = menu.separator();
-
-        menu
     }
 
     pub fn selected_agent(&self) -> AgentType {
@@ -1506,8 +1974,8 @@ impl AgentPanel {
                 summarize_thread,
                 workspace.clone(),
                 project,
-                self.history_store.clone(),
                 self.prompt_store.clone(),
+                Some(self.agent_sessions.clone()),
                 !loading,
                 window,
                 cx,
@@ -1527,7 +1995,8 @@ impl Focusable for AgentPanel {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         match &self.active_view {
             ActiveView::ExternalAgentThread { thread_view, .. } => thread_view.focus_handle(cx),
-            ActiveView::History => self.acp_history.focus_handle(cx),
+            ActiveView::HistoryAgent => self.acp_history.focus_handle(cx),
+            ActiveView::HistoryText => self.text_history.focus_handle(cx),
             ActiveView::TextThread {
                 text_thread_editor, ..
             } => text_thread_editor.focus_handle(cx),
@@ -1630,6 +2099,61 @@ impl Panel for AgentPanel {
 }
 
 impl AgentPanel {
+    fn navigation_mode(&self) -> NavigationMode {
+        match &self.active_view {
+            ActiveView::TextThread { .. } | ActiveView::HistoryText => NavigationMode::TextThreads,
+            ActiveView::ExternalAgentThread { .. } | ActiveView::HistoryAgent => {
+                NavigationMode::AgentSessions
+            }
+            ActiveView::Configuration => NavigationMode::AgentSessions,
+        }
+    }
+
+    fn set_agent_session_list_provider(
+        &mut self,
+        provider: Rc<dyn AgentSessionList>,
+        cx: &mut Context<Self>,
+    ) {
+        self.agent_delete_supported = provider.supports_delete();
+        self.agent_delete_all_supported = provider.delete_all_sessions(cx).is_some();
+        self.agent_session_list = Some(provider);
+    }
+
+    fn refresh_agent_session_snapshot(&mut self, cx: &mut Context<Self>) {
+        let Some(provider) = self.agent_session_list.clone() else {
+            self.agent_sessions.clear();
+            self.agent_delete_supported = false;
+            self.agent_delete_all_supported = false;
+            return;
+        };
+
+        self.agent_delete_supported = provider.supports_delete();
+        self.agent_delete_all_supported = provider.delete_all_sessions(cx).is_some();
+
+        let list_task = provider.list(SessionListParams::default(), cx);
+
+        self._agent_sessions_refresh_task = cx.spawn(async move |this, cx| {
+            let result = match list_task.await {
+                Ok(result) => result,
+                Err(err) => {
+                    log::error!("Failed to refresh agent session snapshot: {err:?}");
+                    return;
+                }
+            };
+
+            let mut sessions = result.sessions;
+            sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+
+            this.update(cx, |this, cx| {
+                this.agent_sessions.update(sessions);
+                // Keep the history view in sync if it is currently visible.
+                this.refresh_acp_history_if_visible(cx);
+                cx.notify();
+            })
+            .log_err();
+        });
+    }
+
     fn render_title_view(&self, _window: &mut Window, cx: &Context<Self>) -> AnyElement {
         const LOADING_SUMMARY_PLACEHOLDER: &str = "Loading Summary…";
 
@@ -1738,7 +2262,9 @@ impl AgentPanel {
                         .into_any_element(),
                 }
             }
-            ActiveView::History => Label::new("History").truncate().into_any_element(),
+            ActiveView::HistoryAgent | ActiveView::HistoryText => {
+                Label::new("History").truncate().into_any_element()
+            }
             ActiveView::Configuration => Label::new("Settings").truncate().into_any_element(),
         };
 
@@ -2018,7 +2544,10 @@ impl AgentPanel {
             ActiveView::ExternalAgentThread { thread_view } => {
                 thread_view.read(cx).as_native_thread(cx)
             }
-            ActiveView::TextThread { .. } | ActiveView::History | ActiveView::Configuration => None,
+            ActiveView::TextThread { .. }
+            | ActiveView::HistoryAgent
+            | ActiveView::HistoryText
+            | ActiveView::Configuration => None,
         };
 
         let new_thread_menu = PopoverMenu::new("new_thread_menu")
@@ -2359,7 +2888,9 @@ impl AgentPanel {
                     .gap(DynamicSpacing::Base04.rems(cx))
                     .pl(DynamicSpacing::Base04.rems(cx))
                     .child(match &self.active_view {
-                        ActiveView::History | ActiveView::Configuration => {
+                        ActiveView::HistoryAgent
+                        | ActiveView::HistoryText
+                        | ActiveView::Configuration => {
                             self.render_toolbar_back_button(cx).into_any_element()
                         }
                         _ => selected_agent.into_any_element(),
@@ -2400,7 +2931,8 @@ impl AgentPanel {
                 }
             }
             ActiveView::ExternalAgentThread { .. }
-            | ActiveView::History
+            | ActiveView::HistoryAgent
+            | ActiveView::HistoryText
             | ActiveView::Configuration => return false,
         }
 
@@ -2433,14 +2965,21 @@ impl AgentPanel {
         }
 
         match &self.active_view {
-            ActiveView::History | ActiveView::Configuration => false,
+            ActiveView::HistoryAgent | ActiveView::HistoryText | ActiveView::Configuration => false,
             ActiveView::ExternalAgentThread { thread_view, .. }
                 if thread_view.read(cx).as_native_thread(cx).is_none() =>
             {
                 false
             }
             _ => {
-                let history_is_empty = self.history_store.read(cx).is_empty(cx);
+                let text_threads_empty = self
+                    .text_thread_store
+                    .read(cx)
+                    .unordered_text_threads()
+                    .next()
+                    .is_none();
+                let agent_sessions_empty = self.agent_sessions.is_empty();
+                let history_is_empty = text_threads_empty && agent_sessions_empty;
 
                 let has_configured_non_zed_providers = LanguageModelRegistry::read_global(cx)
                     .visible_providers()
@@ -2671,7 +3210,7 @@ impl AgentPanel {
                     this.update_in(cx, |this, window, cx| {
                         this.handle_drop(paths, added_worktrees, window, cx);
                     })
-                    .ok();
+                    .log_err();
                 })
                 .detach();
             }))
@@ -2703,7 +3242,7 @@ impl AgentPanel {
                     );
                 });
             }
-            ActiveView::History | ActiveView::Configuration => {}
+            ActiveView::HistoryAgent | ActiveView::HistoryText | ActiveView::Configuration => {}
         }
     }
 
@@ -2745,7 +3284,7 @@ impl AgentPanel {
         match &self.active_view {
             ActiveView::ExternalAgentThread { .. } => key_context.add("acp_thread"),
             ActiveView::TextThread { .. } => key_context.add("text_thread"),
-            ActiveView::History | ActiveView::Configuration => {}
+            ActiveView::HistoryAgent | ActiveView::HistoryText | ActiveView::Configuration => {}
         }
         key_context
     }
@@ -2796,8 +3335,10 @@ impl Render for AgentPanel {
             .map(|parent| match &self.active_view {
                 ActiveView::ExternalAgentThread { thread_view, .. } => parent
                     .child(thread_view.clone())
-                    .child(self.render_drag_target(cx)),
-                ActiveView::History => parent.child(self.acp_history.clone()),
+                    .child(self.render_drag_target(cx))
+                    .child(self.render_agent_session_recent_list(window, cx)),
+                ActiveView::HistoryAgent => parent.child(self.acp_history.clone()),
+                ActiveView::HistoryText => parent.child(self.render_text_thread_history()),
                 ActiveView::TextThread {
                     text_thread_editor,
                     buffer_search_bar,
@@ -2866,16 +3407,14 @@ impl rules_library::InlineAssistDelegate for PromptLibraryInlineAssist {
             let Some(workspace) = self.workspace.upgrade() else {
                 return;
             };
-            let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx) else {
+            let Some(_panel) = workspace.read(cx).panel::<AgentPanel>(cx) else {
                 return;
             };
             let project = workspace.read(cx).project().downgrade();
-            let thread_store = panel.read(cx).thread_store().clone();
             assistant.assist(
                 prompt_editor,
                 self.workspace.clone(),
                 project,
-                thread_store,
                 None,
                 initial_prompt,
                 window,
@@ -3016,5 +3555,354 @@ impl AgentPanel {
     /// method for test assertions. Not compiled into production builds.
     pub fn active_thread_view_for_tests(&self) -> Option<&Entity<AcpThreadView>> {
         self.active_thread_view()
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use acp_thread::{
+        AgentConnection, AgentSessionInfo, MockAgentSessionList, StubAgentConnection,
+    };
+    use agent_client_protocol as acp;
+    use agent_servers::AgentServerDelegate;
+    use assistant_slash_commands;
+    use chrono::Utc;
+    use fs::FakeFs;
+    use gpui::{TestAppContext, VisualTestContext};
+    use project::Project;
+    use prompt_store::PromptBuilder;
+    use settings::SettingsStore;
+    use std::any::Any;
+    use std::sync::Arc;
+    use workspace::GoBack;
+
+    pub(crate) fn init_test(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme::init(theme::LoadThemes::JustBase, cx);
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+            prompt_store::init(cx);
+            language_model::init_settings(cx);
+            assistant_slash_command::init(cx);
+
+            // Register slash commands needed for text thread tests
+            let slash_command_registry = assistant_slash_command::SlashCommandRegistry::global(cx);
+            slash_command_registry
+                .register_command(assistant_slash_commands::DefaultSlashCommand, false);
+        });
+    }
+
+    async fn setup_agent_panel(
+        mock_session_list: Option<Arc<MockAgentSessionList>>,
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<AgentPanel>,
+        Entity<Workspace>,
+        &mut VisualTestContext,
+    ) {
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+
+        let prompt_builder = Arc::new(PromptBuilder::new(None).unwrap());
+        let slash_commands = Arc::new(SlashCommandWorkingSet::default());
+
+        let text_thread_store = cx
+            .update(|_window, cx| {
+                assistant_text_thread::TextThreadStore::new(
+                    project.clone(),
+                    prompt_builder,
+                    slash_commands,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            cx.new(|cx| AgentPanel::new(workspace, text_thread_store, None, window, cx))
+        });
+
+        // If a mock session list is provided, configure StubAgentConnection with it
+        // and create a thread view that exposes the session_list capability.
+        if let Some(session_list) = mock_session_list {
+            panel.update_in(cx, |panel, window, cx| {
+                let connection = StubAgentConnection::new().with_session_list(session_list.clone());
+                let stub_server = Rc::new(StubAgentServer::new(connection));
+
+                let thread_view = cx.new(|cx| {
+                    crate::acp::AcpThreadView::new(
+                        stub_server,
+                        None,
+                        None,
+                        workspace.downgrade(),
+                        project.clone(),
+                        None,
+                        None,
+                        false,
+                        window,
+                        cx,
+                    )
+                });
+
+                panel.active_view = ActiveView::ExternalAgentThread { thread_view };
+
+                // Populate the session list snapshot from the mock provider.
+                // Clone the MockAgentSessionList and wrap in Rc (the underlying Arc<Mutex<>>
+                // data is shared, so modifications are visible to both).
+                let provider = Rc::new((*session_list).clone()) as Rc<dyn AgentSessionList>;
+                panel.set_agent_session_list_provider(provider, cx);
+                panel
+                    .agent_sessions
+                    .update(session_list.sessions.lock().clone());
+            });
+        }
+
+        (panel, workspace, cx)
+    }
+
+    fn create_mock_sessions(count: usize) -> Vec<AgentSessionInfo> {
+        (0..count)
+            .map(|i| AgentSessionInfo {
+                session_id: acp::SessionId::new(format!("session-{}", i)),
+                cwd: None,
+                title: Some(format!("Test Session {}", i).into()),
+                updated_at: Some(Utc::now()),
+                meta: None,
+            })
+            .collect()
+    }
+
+    #[gpui::test]
+    async fn test_history_action_routes_to_correct_view(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let mock_sessions = create_mock_sessions(3);
+        let mock_session_list = Arc::new(MockAgentSessionList::new().with_sessions(mock_sessions));
+
+        let (panel, _workspace, cx) = setup_agent_panel(Some(mock_session_list), cx).await;
+        cx.run_until_parked();
+
+        // Initial state: should be in ExternalAgentThread (agent session mode)
+        panel.read_with(cx, |panel, _cx| {
+            assert!(
+                matches!(panel.active_view, ActiveView::ExternalAgentThread { .. }),
+                "Expected ExternalAgentThread, got {:?}",
+                std::mem::discriminant(&panel.active_view)
+            );
+            assert_eq!(panel.navigation_mode(), NavigationMode::AgentSessions);
+        });
+
+        // Action: Dispatch OpenHistory while in agent-session mode
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_history(window, cx);
+        });
+
+        // Assert: Should route to HistoryAgent
+        panel.read_with(cx, |panel, _cx| {
+            assert!(
+                matches!(panel.active_view, ActiveView::HistoryAgent),
+                "Expected HistoryAgent after OpenHistory in agent mode"
+            );
+        });
+
+        // Go back to agent thread view
+        panel.update_in(cx, |panel, window, cx| {
+            panel.go_back(&GoBack, window, cx);
+        });
+
+        panel.read_with(cx, |panel, _cx| {
+            assert!(
+                matches!(panel.active_view, ActiveView::ExternalAgentThread { .. }),
+                "Expected to return to ExternalAgentThread after go_back"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_navigation_mode_reflects_active_view(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let mock_session_list =
+            Arc::new(MockAgentSessionList::new().with_sessions(create_mock_sessions(2)));
+
+        let (panel, _workspace, cx) = setup_agent_panel(Some(mock_session_list), cx).await;
+        cx.run_until_parked();
+
+        // ExternalAgentThread → AgentSessions mode
+        panel.read_with(cx, |panel, _cx| {
+            assert_eq!(panel.navigation_mode(), NavigationMode::AgentSessions);
+        });
+
+        // Switch to HistoryAgent → still AgentSessions mode
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_history(window, cx);
+        });
+
+        panel.read_with(cx, |panel, _cx| {
+            assert!(matches!(panel.active_view, ActiveView::HistoryAgent));
+            assert_eq!(panel.navigation_mode(), NavigationMode::AgentSessions);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_agent_sessions_snapshot_populated_from_provider(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let sessions = create_mock_sessions(5);
+        let mock_session_list = Arc::new(
+            MockAgentSessionList::new()
+                .with_sessions(sessions.clone())
+                .with_delete_supported(true)
+                .with_delete_all_supported(false),
+        );
+
+        let (panel, _workspace, cx) = setup_agent_panel(Some(mock_session_list), cx).await;
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _cx| {
+            let sessions = panel.agent_sessions.get();
+            assert_eq!(sessions.len(), 5);
+            assert!(panel.agent_delete_supported);
+            assert!(!panel.agent_delete_all_supported);
+
+            // Verify session IDs match
+            for (i, session) in sessions.iter().enumerate() {
+                assert_eq!(session.session_id.0.as_ref(), format!("session-{}", i));
+            }
+        });
+    }
+
+    #[gpui::test]
+    async fn test_delete_from_history_refreshes_visible_items(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let mock_sessions = create_mock_sessions(3);
+        let mock_session_list = Arc::new(
+            MockAgentSessionList::new()
+                .with_sessions(mock_sessions)
+                .with_delete_supported(true),
+        );
+
+        let (panel, _workspace, cx) = setup_agent_panel(Some(mock_session_list.clone()), cx).await;
+        cx.run_until_parked();
+
+        // Initial state: 3 sessions in panel snapshot
+        panel.read_with(cx, |panel, _cx| {
+            assert_eq!(panel.agent_sessions.get().len(), 3);
+        });
+
+        // Open history view
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_history(window, cx);
+        });
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _cx| {
+            assert!(matches!(panel.active_view, ActiveView::HistoryAgent));
+        });
+
+        // Simulate delete by removing a session from the mock and triggering refresh
+        mock_session_list
+            .sessions
+            .lock()
+            .retain(|s| s.session_id.0.as_ref() != "session-0");
+
+        // Trigger refresh on the history view
+        panel.update_in(cx, |panel, _window, cx| {
+            panel
+                .acp_history
+                .update(cx, |history: &mut AcpThreadHistory, cx| {
+                    history.refresh(cx);
+                });
+        });
+        cx.run_until_parked();
+
+        // Verify: mock session list should have 2 sessions now
+        assert_eq!(mock_session_list.sessions.lock().len(), 2);
+    }
+
+    #[gpui::test]
+    async fn test_text_thread_history_routing(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let (panel, _workspace, cx) = setup_agent_panel(None, cx).await;
+        cx.run_until_parked();
+
+        // Create a text thread to put us in text thread mode
+        panel.update_in(cx, |panel, window, cx| {
+            panel.new_text_thread(window, cx);
+        });
+
+        panel.read_with(cx, |panel, _cx| {
+            assert!(matches!(panel.active_view, ActiveView::TextThread { .. }));
+            assert_eq!(panel.navigation_mode(), NavigationMode::TextThreads);
+        });
+
+        // Open history - should route to HistoryText (not HistoryAgent)
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_history(window, cx);
+        });
+
+        panel.read_with(cx, |panel, _cx| {
+            assert!(
+                matches!(panel.active_view, ActiveView::HistoryText),
+                "Expected HistoryText after OpenHistory in text thread mode, got {:?}",
+                std::mem::discriminant(&panel.active_view)
+            );
+            // Navigation mode should still be TextThreads
+            assert_eq!(panel.navigation_mode(), NavigationMode::TextThreads);
+        });
+
+        // Go back should return to text thread
+        panel.update_in(cx, |panel, window, cx| {
+            panel.go_back(&GoBack, window, cx);
+        });
+
+        panel.read_with(cx, |panel, _cx| {
+            assert!(
+                matches!(panel.active_view, ActiveView::TextThread { .. }),
+                "Expected to return to TextThread after go_back"
+            );
+        });
+    }
+
+    struct StubAgentServer<C> {
+        connection: C,
+    }
+
+    impl<C> StubAgentServer<C> {
+        fn new(connection: C) -> Self {
+            Self { connection }
+        }
+    }
+
+    impl<C> AgentServer for StubAgentServer<C>
+    where
+        C: 'static + AgentConnection + Send + Clone,
+    {
+        fn logo(&self) -> ui::IconName {
+            ui::IconName::Ai
+        }
+
+        fn name(&self) -> SharedString {
+            "Test".into()
+        }
+
+        fn connect(
+            &self,
+            _root_dir: Option<&Path>,
+            _delegate: AgentServerDelegate,
+            _cx: &mut App,
+        ) -> Task<gpui::Result<(Rc<dyn AgentConnection>, Option<task::SpawnInTerminal>)>> {
+            Task::ready(Ok((Rc::new(self.connection.clone()), None)))
+        }
+
+        fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
+            self
+        }
     }
 }

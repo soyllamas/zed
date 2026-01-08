@@ -267,7 +267,6 @@ impl AgentsPanel {
         let fs = self.fs.clone();
         let workspace = self.workspace.clone();
         let project = self.project.clone();
-        let history_store = self.history_store.clone();
         let prompt_store = self.prompt_store.clone();
 
         let agent_thread_pane = cx.new(|cx| {
@@ -277,7 +276,6 @@ impl AgentsPanel {
                 fs,
                 workspace.clone(),
                 project,
-                history_store,
                 prompt_store,
                 window,
                 cx,

@@ -23,16 +23,12 @@ const DEFAULT_TITLE: &SharedString = &SharedString::new_static("New Thread");
 //todo: We should remove this function once we support loading all acp thread
 pub fn load_agent_thread(
     session_id: acp::SessionId,
-    history_store: Entity<HistoryStore>,
     project: Entity<Project>,
     cx: &mut App,
 ) -> Task<Result<Entity<crate::Thread>>> {
     use agent_servers::{AgentServer, AgentServerDelegate};
 
-    let server = Rc::new(crate::NativeAgentServer::new(
-        project.read(cx).fs().clone(),
-        history_store,
-    ));
+    let server = Rc::new(crate::NativeAgentServer::new(project.read(cx).fs().clone()));
     let delegate = AgentServerDelegate::new(
         project.read(cx).agent_server_store().clone(),
         project.clone(),

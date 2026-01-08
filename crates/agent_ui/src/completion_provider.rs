@@ -1,11 +1,11 @@
 use std::cmp::Reverse;
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use acp_thread::MentionUri;
-use agent::{HistoryEntry, HistoryStore};
+use agent_client_protocol as acp;
 use anyhow::Result;
 use editor::{
     CompletionProvider, Editor, ExcerptId, code_context_menus::COMPLETION_MENU_MAX_WIDTH,
@@ -132,11 +132,60 @@ impl PromptContextType {
 pub(crate) enum Match {
     File(FileMatch),
     Symbol(SymbolMatch),
-    Thread(HistoryEntry),
-    RecentThread(HistoryEntry),
+    Thread(ThreadCompletionEntry),
+    RecentThread(ThreadCompletionEntry),
     Fetch(SharedString),
     Rules(RulesContextEntry),
     Entry(EntryMatch),
+}
+
+/// A thread entry for completion purposes.
+/// Works for both agent sessions and text threads.
+#[derive(Debug, Clone)]
+pub struct ThreadCompletionEntry {
+    pub title: SharedString,
+    pub kind: ThreadCompletionKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum ThreadCompletionKind {
+    AgentSession {
+        session_id: acp::SessionId,
+    },
+    #[allow(dead_code)]
+    TextThread {
+        path: Arc<Path>,
+    },
+}
+
+impl ThreadCompletionEntry {
+    pub fn agent_session(session_id: acp::SessionId, title: impl Into<SharedString>) -> Self {
+        Self {
+            title: title.into(),
+            kind: ThreadCompletionKind::AgentSession { session_id },
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn text_thread(path: Arc<Path>, title: impl Into<SharedString>) -> Self {
+        Self {
+            title: title.into(),
+            kind: ThreadCompletionKind::TextThread { path },
+        }
+    }
+
+    pub fn mention_uri(&self) -> MentionUri {
+        match &self.kind {
+            ThreadCompletionKind::AgentSession { session_id } => MentionUri::Thread {
+                id: session_id.clone(),
+                name: self.title.to_string(),
+            },
+            ThreadCompletionKind::TextThread { path } => MentionUri::TextThread {
+                path: path.to_path_buf(),
+                name: self.title.to_string(),
+            },
+        }
+    }
 }
 
 impl Match {
@@ -180,13 +229,20 @@ pub trait PromptCompletionProviderDelegate: Send + Sync + 'static {
 
     fn available_commands(&self, cx: &App) -> Vec<AvailableCommand>;
     fn confirm_command(&self, cx: &mut App);
+
+    /// Returns thread entries available for @thread completions.
+    /// For agent views, returns agent sessions from the current connection.
+    /// For text thread views / inline assist, returns text threads.
+    fn thread_entries(&self, cx: &App) -> Vec<ThreadCompletionEntry> {
+        let _ = cx;
+        Vec::new()
+    }
 }
 
 pub struct PromptCompletionProvider<T: PromptCompletionProviderDelegate> {
     source: Arc<T>,
     editor: WeakEntity<Editor>,
     mention_set: Entity<MentionSet>,
-    history_store: Entity<HistoryStore>,
     prompt_store: Option<Entity<PromptStore>>,
     workspace: WeakEntity<Workspace>,
 }
@@ -196,7 +252,6 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
         source: T,
         editor: WeakEntity<Editor>,
         mention_set: Entity<MentionSet>,
-        history_store: Entity<HistoryStore>,
         prompt_store: Option<Entity<PromptStore>>,
         workspace: WeakEntity<Workspace>,
     ) -> Self {
@@ -205,7 +260,6 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
             editor,
             mention_set,
             workspace,
-            history_store,
             prompt_store,
         }
     }
@@ -246,7 +300,7 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
     }
 
     fn completion_for_thread(
-        thread_entry: HistoryEntry,
+        thread_entry: ThreadCompletionEntry,
         source_range: Range<Anchor>,
         recent: bool,
         source: Arc<T>,
@@ -269,7 +323,7 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
         Completion {
             replace_range: source_range.clone(),
             new_text,
-            label: CodeLabel::plain(thread_entry.title().to_string(), None),
+            label: CodeLabel::plain(thread_entry.title.to_string(), None),
             documentation: None,
             insert_text_mode: None,
             source: project::CompletionSource::Custom,
@@ -277,7 +331,7 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
             snippet_deduplication_key: None,
             icon_path: Some(icon_for_completion),
             confirm: Some(confirm_completion_callback(
-                thread_entry.title().clone(),
+                thread_entry.title,
                 source_range.start,
                 new_text_len - 1,
                 uri,
@@ -636,8 +690,8 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
             }
 
             Some(PromptContextType::Thread) => {
-                let search_threads_task =
-                    search_threads(query, cancellation_flag, &self.history_store, cx);
+                let threads = self.source.thread_entries(cx);
+                let search_threads_task = search_threads(query, cancellation_flag, threads, cx);
                 cx.background_spawn(async move {
                     search_threads_task
                         .await
@@ -800,9 +854,8 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
         if self.source.supports_context(PromptContextType::Thread, cx) {
             const RECENT_COUNT: usize = 2;
             let threads = self
-                .history_store
-                .read(cx)
-                .recently_opened_entries(cx)
+                .source
+                .thread_entries(cx)
                 .into_iter()
                 .filter(|thread| !mentions.contains(&thread.mention_uri()))
                 .take(RECENT_COUNT)
@@ -1529,10 +1582,9 @@ pub(crate) fn search_symbols(
 pub(crate) fn search_threads(
     query: String,
     cancellation_flag: Arc<AtomicBool>,
-    thread_store: &Entity<HistoryStore>,
+    threads: Vec<ThreadCompletionEntry>,
     cx: &mut App,
-) -> Task<Vec<HistoryEntry>> {
-    let threads = thread_store.read(cx).entries().collect();
+) -> Task<Vec<ThreadCompletionEntry>> {
     if query.is_empty() {
         return Task::ready(threads);
     }
@@ -1542,7 +1594,7 @@ pub(crate) fn search_threads(
         let candidates = threads
             .iter()
             .enumerate()
-            .map(|(id, thread)| StringMatchCandidate::new(id, thread.title()))
+            .map(|(id, thread)| StringMatchCandidate::new(id, &thread.title))
             .collect::<Vec<_>>();
         let matches = fuzzy::match_strings(
             &candidates,

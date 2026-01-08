@@ -11,11 +11,12 @@ use crate::context::load_context;
 use crate::mention_set::MentionSet;
 use crate::{
     AgentPanel,
+    agent_panel::AgentSessions,
     buffer_codegen::{BufferCodegen, CodegenAlternative, CodegenEvent},
     inline_prompt_editor::{CodegenStatus, InlineAssistId, PromptEditor, PromptEditorEvent},
     terminal_inline_assistant::TerminalInlineAssistant,
 };
-use agent::HistoryStore;
+
 use agent_settings::AgentSettings;
 use anyhow::{Context as _, Result};
 use collections::{HashMap, HashSet, VecDeque, hash_map};
@@ -263,7 +264,6 @@ impl InlineAssistant {
         let agent_panel = agent_panel.read(cx);
 
         let prompt_store = agent_panel.prompt_store().as_ref().cloned();
-        let thread_store = agent_panel.thread_store().clone();
 
         let handle_assist =
             |window: &mut Window, cx: &mut Context<Workspace>| match inline_assist_target {
@@ -273,7 +273,6 @@ impl InlineAssistant {
                             &active_editor,
                             cx.entity().downgrade(),
                             workspace.project().downgrade(),
-                            thread_store,
                             prompt_store,
                             action.prompt.clone(),
                             window,
@@ -287,7 +286,6 @@ impl InlineAssistant {
                             &active_terminal,
                             cx.entity().downgrade(),
                             workspace.project().downgrade(),
-                            thread_store,
                             prompt_store,
                             action.prompt.clone(),
                             window,
@@ -468,7 +466,6 @@ impl InlineAssistant {
         editor: &Entity<Editor>,
         workspace: WeakEntity<Workspace>,
         project: WeakEntity<Project>,
-        thread_store: Entity<HistoryStore>,
         prompt_store: Option<Entity<PromptStore>>,
         initial_prompt: Option<String>,
         window: &mut Window,
@@ -505,6 +502,13 @@ impl InlineAssistant {
             });
 
             let editor_margins = Arc::new(Mutex::new(EditorMargins::default()));
+
+            // Get shared agent sessions from AgentPanel for thread completions
+            let agent_sessions: Option<AgentSessions> = workspace
+                .upgrade()
+                .and_then(|ws| ws.read(cx).panel::<AgentPanel>(cx))
+                .map(|panel| panel.read(cx).agent_sessions());
+
             let prompt_editor = cx.new(|cx| {
                 PromptEditor::new_buffer(
                     assist_id,
@@ -514,10 +518,10 @@ impl InlineAssistant {
                     codegen.clone(),
                     session_id,
                     self.fs.clone(),
-                    thread_store.clone(),
                     prompt_store.clone(),
                     project.clone(),
                     workspace.clone(),
+                    agent_sessions.clone(),
                     window,
                     cx,
                 )
@@ -605,7 +609,6 @@ impl InlineAssistant {
         editor: &Entity<Editor>,
         workspace: WeakEntity<Workspace>,
         project: WeakEntity<Project>,
-        thread_store: Entity<HistoryStore>,
         prompt_store: Option<Entity<PromptStore>>,
         initial_prompt: Option<String>,
         window: &mut Window,
@@ -623,7 +626,6 @@ impl InlineAssistant {
             editor,
             workspace,
             project,
-            thread_store,
             prompt_store,
             initial_prompt,
             window,
@@ -648,7 +650,6 @@ impl InlineAssistant {
         initial_transaction_id: Option<TransactionId>,
         focus: bool,
         workspace: Entity<Workspace>,
-        thread_store: Entity<HistoryStore>,
         prompt_store: Option<Entity<PromptStore>>,
         window: &mut Window,
         cx: &mut App,
@@ -667,7 +668,6 @@ impl InlineAssistant {
                 editor,
                 workspace.downgrade(),
                 project,
-                thread_store,
                 prompt_store,
                 Some(initial_prompt),
                 window,
@@ -1934,20 +1934,21 @@ impl CodeActionProvider for AssistantCodeActionProvider {
     ) -> Task<Result<ProjectTransaction>> {
         let editor = self.editor.clone();
         let workspace = self.workspace.clone();
-        let prompt_store = PromptStore::global(cx);
+        let _prompt_store = PromptStore::global(cx);
         window.spawn(cx, async move |cx| {
             let workspace = workspace.upgrade().context("workspace was released")?;
-            let thread_store = cx.update(|_window, cx| {
-                anyhow::Ok(
+            let prompt_store = cx
+                .update(|_window, cx| {
                     workspace
                         .read(cx)
                         .panel::<AgentPanel>(cx)
                         .context("missing agent panel")?
                         .read(cx)
-                        .thread_store()
-                        .clone(),
-                )
-            })??;
+                        .prompt_store()
+                        .clone()
+                        .context("missing prompt store")
+                })?
+                .ok();
             let editor = editor.upgrade().context("editor was released")?;
             let range = editor
                 .update(cx, |editor, cx| {
@@ -1981,7 +1982,6 @@ impl CodeActionProvider for AssistantCodeActionProvider {
                 })
                 .context("invalid range")?;
 
-            let prompt_store = prompt_store.await.ok();
             cx.update_global(|assistant: &mut InlineAssistant, window, cx| {
                 let assist_id = assistant.suggest_assist(
                     &editor,
@@ -1990,7 +1990,6 @@ impl CodeActionProvider for AssistantCodeActionProvider {
                     None,
                     true,
                     workspace,
-                    thread_store,
                     prompt_store,
                     window,
                     cx,
@@ -2031,8 +2030,6 @@ pub mod test {
 
     use std::sync::Arc;
 
-    use agent::HistoryStore;
-    use assistant_text_thread::TextThreadStore;
     use client::{Client, UserStore};
     use editor::{Editor, MultiBuffer, MultiBufferOffset};
     use fs::FakeFs;
@@ -2131,9 +2128,6 @@ pub mod test {
                 })
             });
 
-            let text_thread_store = cx.new(|cx| TextThreadStore::fake(project.clone(), cx));
-            let history_store = cx.new(|cx| HistoryStore::new(text_thread_store, cx));
-
             // Add editor to workspace
             workspace.update(cx, |workspace, cx| {
                 workspace.add_item_to_active_pane(Box::new(editor.clone()), None, true, window, cx);
@@ -2146,8 +2140,7 @@ pub mod test {
                         &editor,
                         workspace.downgrade(),
                         project.downgrade(),
-                        history_store, // thread_store
-                        None,          // prompt_store
+                        None, // prompt_store
                         Some(prompt),
                         window,
                         cx,

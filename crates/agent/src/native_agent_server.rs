@@ -6,21 +6,20 @@ use agent_settings::AgentSettings;
 use anyhow::Result;
 use collections::HashSet;
 use fs::Fs;
-use gpui::{App, Entity, SharedString, Task};
+use gpui::{App, SharedString, Task};
 use prompt_store::PromptStore;
 use settings::{LanguageModelSelection, Settings as _, update_settings_file};
 
-use crate::{HistoryStore, NativeAgent, NativeAgentConnection, templates::Templates};
+use crate::{NativeAgent, NativeAgentConnection, templates::Templates};
 
 #[derive(Clone)]
 pub struct NativeAgentServer {
     fs: Arc<dyn Fs>,
-    history: Entity<HistoryStore>,
 }
 
 impl NativeAgentServer {
-    pub fn new(fs: Arc<dyn Fs>, history: Entity<HistoryStore>) -> Self {
-        Self { fs, history }
+    pub fn new(fs: Arc<dyn Fs>) -> Self {
+        Self { fs }
     }
 }
 
@@ -50,7 +49,6 @@ impl AgentServer for NativeAgentServer {
         );
         let project = delegate.project().clone();
         let fs = self.fs.clone();
-        let history = self.history.clone();
         let prompt_store = PromptStore::global(cx);
         cx.spawn(async move |cx| {
             log::debug!("Creating templates for native agent");
@@ -58,8 +56,7 @@ impl AgentServer for NativeAgentServer {
             let prompt_store = prompt_store.await?;
 
             log::debug!("Creating native agent entity");
-            let agent =
-                NativeAgent::new(project, history, templates, Some(prompt_store), fs, cx).await?;
+            let agent = NativeAgent::new(project, templates, Some(prompt_store), fs, cx).await?;
 
             // Create the connection wrapper
             let connection = NativeAgentConnection(agent);
@@ -113,11 +110,8 @@ fn model_id_to_selection(model_id: &acp::ModelId) -> LanguageModelSelection {
 mod tests {
     use super::*;
 
-    use assistant_text_thread::TextThreadStore;
-    use gpui::AppContext;
-
     agent_servers::e2e_tests::common_e2e_tests!(
-        async |fs, project, cx| {
+        async |fs, _project, cx| {
             let auth = cx.update(|cx| {
                 prompt_store::init(cx);
                 let registry = language_model::LanguageModelRegistry::read_global(cx);
@@ -145,13 +139,7 @@ mod tests {
                 });
             });
 
-            let history = cx.update(|cx| {
-                let text_thread_store =
-                    cx.new(move |cx| TextThreadStore::fake(project.clone(), cx));
-                cx.new(move |cx| HistoryStore::new(text_thread_store, cx))
-            });
-
-            NativeAgentServer::new(fs.clone(), history)
+            NativeAgentServer::new(fs.clone())
         },
         allow_option_id = "allow"
     );

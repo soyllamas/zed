@@ -1,6 +1,7 @@
 use crate::AcpThread;
 use agent_client_protocol::{self as acp};
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use collections::IndexMap;
 use gpui::{Entity, SharedString, Task};
 use language_model::LanguageModelProviderId;
@@ -66,6 +67,10 @@ pub trait AgentConnection {
         None
     }
 
+    fn session_list(&self, _cx: &mut App) -> Option<Rc<dyn AgentSessionList>> {
+        None
+    }
+
     /// Returns this agent as an [Rc<dyn ModelSelector>] if the model selection capability is supported.
     ///
     /// If the agent does not support model selection, returns [None].
@@ -100,6 +105,91 @@ pub trait AgentConnection {
 impl dyn AgentConnection {
     pub fn downcast<T: 'static + AgentConnection + Sized>(self: Rc<Self>) -> Option<Rc<T>> {
         self.into_any().downcast().ok()
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionListParams {
+    pub cursor: Option<String>,
+    pub cwd: Option<Arc<Path>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionListResult {
+    pub sessions: Vec<AgentSessionInfo>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentSessionInfo {
+    pub session_id: acp::SessionId,
+    pub cwd: Option<Arc<Path>>,
+    pub title: Option<SharedString>,
+    pub updated_at: Option<DateTime<Utc>>,
+    pub meta: Option<serde_json::Value>,
+}
+
+impl AgentSessionInfo {
+    /// Returns the display title for this session, falling back to "New Thread" if the title
+    /// is empty or whitespace-only.
+    pub fn display_title(&self) -> SharedString {
+        self.title
+            .clone()
+            .filter(|title| !title.trim().is_empty())
+            .unwrap_or_else(|| "New Thread".into())
+    }
+}
+
+pub trait AgentSessionList {
+    fn list(&self, params: SessionListParams, cx: &mut App) -> Task<Result<SessionListResult>>;
+
+    /// Whether this agent supports deleting sessions from the session list UI.
+    ///
+    /// This is intentionally agent-level (not per-session) so UI can cache it
+    /// without probing during `render()` or fabricating a dummy `SessionId`.
+    fn supports_delete(&self) -> bool {
+        false
+    }
+
+    fn delete_session(
+        &self,
+        _session_id: &acp::SessionId,
+        _cx: &mut App,
+    ) -> Option<Rc<dyn AgentSessionDelete>> {
+        None
+    }
+
+    /// Optional capability to delete all sessions for this agent.
+    ///
+    /// This exists to support the "Delete All History" UI affordance without requiring the UI to
+    /// enumerate and delete sessions one-by-one.
+    ///
+    /// Implementations should perform the deletion asynchronously and may choose to update any
+    /// internal caches as part of the operation.
+    fn delete_all_sessions(&self, _cx: &mut App) -> Option<Rc<dyn AgentSessionDeleteAll>> {
+        None
+    }
+}
+
+pub trait AgentSessionDelete {
+    fn run(&self, cx: &mut App) -> Task<Result<()>>;
+}
+
+pub trait AgentSessionDeleteAll {
+    fn run(&self, cx: &mut App) -> Task<Result<()>>;
+}
+
+/// A no-op session list provider that always returns an empty list.
+///
+/// Useful as a placeholder when no connection-backed provider is available yet.
+pub struct EmptySessionList;
+
+impl AgentSessionList for EmptySessionList {
+    fn list(&self, _params: SessionListParams, _cx: &mut App) -> Task<Result<SessionListResult>> {
+        Task::ready(Ok(SessionListResult {
+            sessions: Vec::new(),
+            next_cursor: None,
+        }))
     }
 }
 
@@ -332,6 +422,7 @@ mod test_support {
         sessions: Arc<Mutex<HashMap<acp::SessionId, Session>>>,
         permission_requests: HashMap<acp::ToolCallId, Vec<acp::PermissionOption>>,
         next_prompt_updates: Arc<Mutex<Vec<acp::SessionUpdate>>>,
+        session_list: Option<Arc<MockAgentSessionList>>,
     }
 
     struct Session {
@@ -345,6 +436,7 @@ mod test_support {
                 next_prompt_updates: Default::default(),
                 permission_requests: HashMap::default(),
                 sessions: Arc::default(),
+                session_list: None,
             }
         }
 
@@ -357,6 +449,11 @@ mod test_support {
             permission_requests: HashMap<acp::ToolCallId, Vec<acp::PermissionOption>>,
         ) -> Self {
             self.permission_requests = permission_requests;
+            self
+        }
+
+        pub fn with_session_list(mut self, session_list: Arc<MockAgentSessionList>) -> Self {
+            self.session_list = Some(session_list);
             self
         }
 
@@ -533,6 +630,12 @@ mod test_support {
             Some(Rc::new(StubAgentSessionEditor))
         }
 
+        fn session_list(&self, _cx: &mut App) -> Option<Rc<dyn AgentSessionList>> {
+            self.session_list
+                .as_ref()
+                .map(|list| Rc::new((**list).clone()) as Rc<dyn AgentSessionList>)
+        }
+
         fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
             self
         }
@@ -563,6 +666,27 @@ mod test_support {
             }
         }
     }
+    /// A mock session list provider for testing.
+    ///
+    /// Sessions can be configured via `set_sessions` and inspected/modified
+    /// through the `sessions` field. Uses `Arc<Mutex<>>` for thread safety
+    /// so that `StubAgentConnection` remains `Send`.
+    #[derive(Clone)]
+    pub struct MockAgentSessionList {
+        pub sessions: Arc<Mutex<Vec<AgentSessionInfo>>>,
+        pub delete_supported: bool,
+        pub delete_all_supported: bool,
+    }
+
+    impl Default for MockAgentSessionList {
+        fn default() -> Self {
+            Self {
+                sessions: Arc::new(Mutex::new(Vec::new())),
+                delete_supported: true,
+                delete_all_supported: true,
+            }
+        }
+    }
 
     impl AgentModelSelector for StubModelSelector {
         fn list_models(&self, _cx: &mut App) -> Task<Result<AgentModelList>> {
@@ -584,6 +708,97 @@ mod test_support {
         /// Returns a model selector for this stub connection.
         pub fn model_selector_impl(&self) -> Rc<dyn AgentModelSelector> {
             Rc::new(StubModelSelector::new())
+        }
+    }
+
+    impl MockAgentSessionList {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        pub fn with_sessions(self, sessions: Vec<AgentSessionInfo>) -> Self {
+            *self.sessions.lock() = sessions;
+            self
+        }
+
+        pub fn with_delete_supported(mut self, supported: bool) -> Self {
+            self.delete_supported = supported;
+            self
+        }
+
+        pub fn with_delete_all_supported(mut self, supported: bool) -> Self {
+            self.delete_all_supported = supported;
+            self
+        }
+
+        pub fn set_sessions(&self, sessions: Vec<AgentSessionInfo>) {
+            *self.sessions.lock() = sessions;
+        }
+    }
+
+    impl AgentSessionList for MockAgentSessionList {
+        fn list(
+            &self,
+            _params: SessionListParams,
+            _cx: &mut App,
+        ) -> Task<Result<SessionListResult>> {
+            let sessions = self.sessions.lock().clone();
+            Task::ready(Ok(SessionListResult {
+                sessions,
+                next_cursor: None,
+            }))
+        }
+
+        fn supports_delete(&self) -> bool {
+            self.delete_supported
+        }
+
+        fn delete_session(
+            &self,
+            session_id: &acp::SessionId,
+            _cx: &mut App,
+        ) -> Option<Rc<dyn AgentSessionDelete>> {
+            if !self.delete_supported {
+                return None;
+            }
+            Some(Rc::new(MockAgentSessionDelete {
+                session_id: session_id.clone(),
+                sessions: self.sessions.clone(),
+            }))
+        }
+
+        fn delete_all_sessions(&self, _cx: &mut App) -> Option<Rc<dyn AgentSessionDeleteAll>> {
+            if !self.delete_all_supported {
+                return None;
+            }
+            Some(Rc::new(MockAgentSessionDeleteAll {
+                sessions: self.sessions.clone(),
+            }))
+        }
+    }
+
+    struct MockAgentSessionDelete {
+        session_id: acp::SessionId,
+        sessions: Arc<Mutex<Vec<AgentSessionInfo>>>,
+    }
+
+    impl AgentSessionDelete for MockAgentSessionDelete {
+        fn run(&self, _cx: &mut App) -> Task<Result<()>> {
+            self.sessions
+                .lock()
+                .retain(|s| s.session_id != self.session_id);
+            Task::ready(Ok(()))
+        }
+    }
+
+    struct MockAgentSessionDeleteAll {
+        sessions: Arc<Mutex<Vec<AgentSessionInfo>>>,
+    }
+
+    impl AgentSessionDeleteAll for MockAgentSessionDeleteAll {
+        fn run(&self, _cx: &mut App) -> Task<Result<()>> {
+            self.sessions.lock().clear();
+            Task::ready(Ok(()))
         }
     }
 }

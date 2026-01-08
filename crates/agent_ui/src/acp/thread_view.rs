@@ -1,3 +1,4 @@
+use crate::agent_panel::AgentSessions;
 use acp_thread::{
     AcpThread, AcpThreadEvent, AgentThreadEntry, AssistantMessage, AssistantMessageChunk,
     AuthRequired, LoadError, MentionUri, RetryStatus, ThreadStatus, ToolCall, ToolCallContent,
@@ -5,9 +6,7 @@ use acp_thread::{
 };
 use acp_thread::{AgentConnection, Plan};
 use action_log::{ActionLog, ActionLogTelemetry};
-use agent::{
-    DbThreadMetadata, HistoryEntry, HistoryEntryId, HistoryStore, NativeAgentServer, SharedThread,
-};
+use agent::{DbThreadMetadata, NativeAgentServer, SharedThread};
 use agent_client_protocol::{self as acp, PromptCapabilities};
 use agent_servers::{AgentServer, AgentServerDelegate};
 use agent_settings::{AgentProfileId, AgentSettings, CompletionMode};
@@ -28,10 +27,11 @@ use fs::Fs;
 use futures::FutureExt as _;
 use gpui::{
     Action, Animation, AnimationExt, AnyView, App, BorderStyle, ClickEvent, ClipboardItem,
-    CursorStyle, EdgesRefinement, ElementId, Empty, Entity, FocusHandle, Focusable, Hsla, Length,
-    ListOffset, ListState, ObjectFit, PlatformDisplay, SharedString, StyleRefinement, Subscription,
-    Task, TextStyle, TextStyleRefinement, UnderlineStyle, WeakEntity, Window, WindowHandle, div,
-    ease_in_out, img, linear_color_stop, linear_gradient, list, point, pulsating_between,
+    CursorStyle, EdgesRefinement, ElementId, Empty, Entity, EventEmitter, FocusHandle, Focusable,
+    Hsla, Length, ListOffset, ListState, ObjectFit, PlatformDisplay, SharedString, StyleRefinement,
+    Subscription, Task, TextStyle, TextStyleRefinement, UnderlineStyle, WeakEntity, Window,
+    WindowHandle, div, ease_in_out, img, linear_color_stop, linear_gradient, list, point,
+    pulsating_between,
 };
 use language::Buffer;
 
@@ -72,8 +72,8 @@ use crate::ui::{AgentNotification, AgentNotificationEvent, BurnModeTooltip, Usag
 use crate::{
     AgentDiffPane, AgentPanel, AllowAlways, AllowOnce, ClearMessageQueue, ContinueThread,
     ContinueWithBurnMode, CycleFavoriteModels, CycleModeSelector, ExpandMessageEditor, Follow,
-    KeepAll, NewThread, OpenAgentDiff, OpenHistory, QueueMessage, RejectAll, RejectOnce,
-    SendNextQueuedMessage, ToggleBurnMode, ToggleProfileSelector,
+    KeepAll, NewThread, OpenAgentDiff, QueueMessage, RejectAll, RejectOnce, SendNextQueuedMessage,
+    ToggleBurnMode, ToggleProfileSelector,
 };
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -264,6 +264,12 @@ impl ThreadFeedbackState {
     }
 }
 
+pub enum AcpThreadViewEvent {
+    ThreadReady,
+}
+
+impl EventEmitter<AcpThreadViewEvent> for AcpThreadView {}
+
 pub struct AcpThreadView {
     agent: Rc<dyn AgentServer>,
     agent_server_store: Entity<AgentServerStore>,
@@ -271,8 +277,6 @@ pub struct AcpThreadView {
     project: Entity<Project>,
     thread_state: ThreadState,
     login: Option<task::SpawnInTerminal>,
-    history_store: Entity<HistoryStore>,
-    hovered_recent_history_item: Option<usize>,
     entry_view_state: Entity<EntryViewState>,
     message_editor: Entity<MessageEditor>,
     focus_handle: FocusHandle,
@@ -347,8 +351,8 @@ impl AcpThreadView {
         summarize_thread: Option<DbThreadMetadata>,
         workspace: WeakEntity<Workspace>,
         project: Entity<Project>,
-        history_store: Entity<HistoryStore>,
         prompt_store: Option<Entity<PromptStore>>,
+        agent_sessions: Option<AgentSessions>,
         track_load_event: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -368,11 +372,11 @@ impl AcpThreadView {
             let mut editor = MessageEditor::new(
                 workspace.clone(),
                 project.downgrade(),
-                history_store.clone(),
                 prompt_store.clone(),
                 prompt_capabilities.clone(),
                 available_commands.clone(),
                 agent.name(),
+                agent_sessions,
                 &placeholder,
                 editor::EditorMode::AutoHeight {
                     min_lines: AgentSettings::get_global(cx).message_editor_min_lines,
@@ -393,7 +397,6 @@ impl AcpThreadView {
             EntryViewState::new(
                 workspace.clone(),
                 project.downgrade(),
-                history_store.clone(),
                 prompt_store.clone(),
                 prompt_capabilities.clone(),
                 available_commands.clone(),
@@ -428,7 +431,7 @@ impl AcpThreadView {
             && project.read(cx).is_local()
             && agent.clone().downcast::<agent_servers::Codex>().is_some();
 
-        Self {
+        let this = Self {
             agent: agent.clone(),
             agent_server_store,
             workspace: workspace.clone(),
@@ -468,8 +471,7 @@ impl AcpThreadView {
             available_commands,
             editor_expanded: false,
             should_be_following: false,
-            history_store,
-            hovered_recent_history_item: None,
+
             is_loading_contents: false,
             _subscriptions: subscriptions,
             _cancel_task: None,
@@ -481,7 +483,9 @@ impl AcpThreadView {
             message_queue: Vec::new(),
             skip_queue_processing_count: 0,
             user_interrupted_generation: false,
-        }
+        };
+
+        this
     }
 
     fn reset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -626,15 +630,6 @@ impl AcpThreadView {
                             );
                         });
 
-                        if let Some(resume) = resume_thread {
-                            this.history_store.update(cx, |history, cx| {
-                                history.push_recently_opened_entry(
-                                    HistoryEntryId::AcpThread(resume.id),
-                                    cx,
-                                );
-                            });
-                        }
-
                         AgentDiff::set_active_thread(&workspace, thread.clone(), window, cx);
 
                         // Check for config options first
@@ -738,6 +733,7 @@ impl AcpThreadView {
 
                         this.message_editor.focus_handle(cx).focus(window, cx);
 
+                        cx.emit(AcpThreadViewEvent::ThreadReady);
                         cx.notify();
                     }
                     Err(err) => {
@@ -1223,13 +1219,6 @@ impl AcpThreadView {
         if self.is_loading_contents {
             return;
         }
-
-        self.history_store.update(cx, |history, cx| {
-            history.push_recently_opened_entry(
-                HistoryEntryId::AcpThread(thread.read(cx).session_id().clone()),
-                cx,
-            );
-        });
 
         if thread.read(cx).status() != ThreadStatus::Idle {
             self.stop_current_and_send_new_message(window, cx);
@@ -3984,104 +3973,10 @@ impl AcpThreadView {
         )
     }
 
-    fn render_empty_state_section_header(
-        &self,
-        label: impl Into<SharedString>,
-        action_slot: Option<AnyElement>,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        div().pl_1().pr_1p5().child(
-            h_flex()
-                .mt_2()
-                .pl_1p5()
-                .pb_1()
-                .w_full()
-                .justify_between()
-                .border_b_1()
-                .border_color(cx.theme().colors().border_variant)
-                .child(
-                    Label::new(label.into())
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                )
-                .children(action_slot),
-        )
-    }
-
-    fn render_recent_history(&self, cx: &mut Context<Self>) -> AnyElement {
-        let render_history = self
-            .agent
-            .clone()
-            .downcast::<agent::NativeAgentServer>()
-            .is_some()
-            && self
-                .history_store
-                .update(cx, |history_store, cx| !history_store.is_empty(cx));
-
-        v_flex()
-            .size_full()
-            .when(render_history, |this| {
-                let recent_history: Vec<_> = self.history_store.update(cx, |history_store, _| {
-                    history_store.entries().take(3).collect()
-                });
-                this.justify_end().child(
-                    v_flex()
-                        .child(
-                            self.render_empty_state_section_header(
-                                "Recent",
-                                Some(
-                                    Button::new("view-history", "View All")
-                                        .style(ButtonStyle::Subtle)
-                                        .label_size(LabelSize::Small)
-                                        .key_binding(
-                                            KeyBinding::for_action_in(
-                                                &OpenHistory,
-                                                &self.focus_handle(cx),
-                                                cx,
-                                            )
-                                            .map(|kb| kb.size(rems_from_px(12.))),
-                                        )
-                                        .on_click(move |_event, window, cx| {
-                                            window.dispatch_action(OpenHistory.boxed_clone(), cx);
-                                        })
-                                        .into_any_element(),
-                                ),
-                                cx,
-                            ),
-                        )
-                        .child(
-                            v_flex().p_1().pr_1p5().gap_1().children(
-                                recent_history
-                                    .into_iter()
-                                    .enumerate()
-                                    .map(|(index, entry)| {
-                                        // TODO: Add keyboard navigation.
-                                        let is_hovered =
-                                            self.hovered_recent_history_item == Some(index);
-                                        crate::acp::thread_history::AcpHistoryEntryElement::new(
-                                            entry,
-                                            cx.entity().downgrade(),
-                                        )
-                                        .hovered(is_hovered)
-                                        .on_hover(cx.listener(
-                                            move |this, is_hovered, _window, cx| {
-                                                if *is_hovered {
-                                                    this.hovered_recent_history_item = Some(index);
-                                                } else if this.hovered_recent_history_item
-                                                    == Some(index)
-                                                {
-                                                    this.hovered_recent_history_item = None;
-                                                }
-                                                cx.notify();
-                                            },
-                                        ))
-                                        .into_any_element()
-                                    }),
-                            ),
-                        ),
-                )
-            })
-            .into_any()
+    fn render_recent_history(&self, _cx: &mut Context<Self>) -> AnyElement {
+        // Recent sessions UI is now owned by AgentPanel so the empty-state list, navigation menu,
+        // and History share a single provider-backed snapshot and ordering.
+        v_flex().size_full().into_any()
     }
 
     fn render_auth_required_state(
@@ -6706,20 +6601,6 @@ impl AcpThreadView {
             }))
     }
 
-    pub fn delete_history_entry(&mut self, entry: HistoryEntry, cx: &mut Context<Self>) {
-        let task = match entry {
-            HistoryEntry::AcpThread(thread) => self.history_store.update(cx, |history, cx| {
-                history.delete_thread(thread.id.clone(), cx)
-            }),
-            HistoryEntry::TextThread(text_thread) => {
-                self.history_store.update(cx, |history, cx| {
-                    history.delete_text_thread(text_thread.path.clone(), cx)
-                })
-            }
-        };
-        task.detach_and_log_err(cx);
-    }
-
     /// Returns the currently active editor, either for a message that is being
     /// edited or the editor for a new message.
     fn active_editor(&self, cx: &App) -> Entity<MessageEditor> {
@@ -7089,7 +6970,6 @@ fn terminal_command_markdown_style(window: &Window, cx: &App) -> MarkdownStyle {
 pub(crate) mod tests {
     use acp_thread::StubAgentConnection;
     use agent_client_protocol::SessionId;
-    use assistant_text_thread::TextThreadStore;
     use editor::MultiBufferOffset;
     use fs::FakeFs;
     use gpui::{EventEmitter, TestAppContext, VisualTestContext};
@@ -7395,11 +7275,6 @@ pub(crate) mod tests {
         let (workspace, cx) =
             cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
 
-        let text_thread_store =
-            cx.update(|_window, cx| cx.new(|cx| TextThreadStore::fake(project.clone(), cx)));
-        let history_store =
-            cx.update(|_window, cx| cx.new(|cx| HistoryStore::new(text_thread_store, cx)));
-
         let thread_view = cx.update(|window, cx| {
             cx.new(|cx| {
                 AcpThreadView::new(
@@ -7408,7 +7283,7 @@ pub(crate) mod tests {
                     None,
                     workspace.downgrade(),
                     project,
-                    history_store,
+                    None,
                     None,
                     false,
                     window,
@@ -7664,11 +7539,6 @@ pub(crate) mod tests {
         let (workspace, cx) =
             cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
 
-        let text_thread_store =
-            cx.update(|_window, cx| cx.new(|cx| TextThreadStore::fake(project.clone(), cx)));
-        let history_store =
-            cx.update(|_window, cx| cx.new(|cx| HistoryStore::new(text_thread_store, cx)));
-
         let connection = Rc::new(StubAgentConnection::new());
         let thread_view = cx.update(|window, cx| {
             cx.new(|cx| {
@@ -7678,7 +7548,7 @@ pub(crate) mod tests {
                     None,
                     workspace.downgrade(),
                     project.clone(),
-                    history_store.clone(),
+                    None,
                     None,
                     false,
                     window,

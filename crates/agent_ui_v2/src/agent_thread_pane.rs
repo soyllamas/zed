@@ -1,4 +1,4 @@
-use agent::{HistoryEntry, HistoryEntryId, HistoryStore, NativeAgentServer};
+use agent::{HistoryEntry, HistoryEntryId, NativeAgentServer};
 use agent_servers::AgentServer;
 use agent_settings::AgentSettings;
 use agent_ui::acp::AcpThreadView;
@@ -100,7 +100,6 @@ impl AgentThreadPane {
         fs: Arc<dyn Fs>,
         workspace: WeakEntity<Workspace>,
         project: Entity<Project>,
-        history_store: Entity<HistoryStore>,
         prompt_store: Option<Entity<PromptStore>>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -112,7 +111,7 @@ impl AgentThreadPane {
             HistoryEntry::TextThread(_) => None,
         };
 
-        let agent: Rc<dyn AgentServer> = Rc::new(NativeAgentServer::new(fs, history_store.clone()));
+        let agent: Rc<dyn AgentServer> = Rc::new(NativeAgentServer::new(fs));
 
         let thread_view = cx.new(|cx| {
             AcpThreadView::new(
@@ -121,8 +120,8 @@ impl AgentThreadPane {
                 None,
                 workspace,
                 project,
-                history_store,
                 prompt_store,
+                None,
                 true,
                 window,
                 cx,

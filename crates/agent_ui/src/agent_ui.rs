@@ -29,7 +29,7 @@ use client::Client;
 use command_palette_hooks::CommandPaletteFilter;
 use feature_flags::{AgentV2FeatureFlag, FeatureFlagAppExt as _};
 use fs::Fs;
-use gpui::{Action, App, Entity, SharedString, actions};
+use gpui::{Action, App, SharedString, actions};
 use language::{
     LanguageRegistry,
     language_settings::{AllLanguageSettings, EditPredictionProvider},
@@ -167,16 +167,12 @@ pub enum ExternalAgent {
 }
 
 impl ExternalAgent {
-    pub fn server(
-        &self,
-        fs: Arc<dyn fs::Fs>,
-        history: Entity<agent::HistoryStore>,
-    ) -> Rc<dyn agent_servers::AgentServer> {
+    pub fn server(&self, fs: Arc<dyn fs::Fs>) -> Rc<dyn agent_servers::AgentServer> {
         match self {
             Self::Gemini => Rc::new(agent_servers::Gemini),
             Self::ClaudeCode => Rc::new(agent_servers::ClaudeCode),
             Self::Codex => Rc::new(agent_servers::Codex),
-            Self::NativeAgent => Rc::new(agent::NativeAgentServer::new(fs, history)),
+            Self::NativeAgent => Rc::new(agent::NativeAgentServer::new(fs)),
             Self::Custom { name } => Rc::new(agent_servers::CustomAgentServer::new(name.clone())),
         }
     }

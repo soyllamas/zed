@@ -1,4 +1,4 @@
-use agent::HistoryStore;
+use crate::agent_panel::AgentSessions;
 use collections::{HashMap, VecDeque};
 use editor::actions::Paste;
 use editor::code_context_menus::CodeContextMenu;
@@ -36,6 +36,7 @@ use crate::agent_model_selector::AgentModelSelector;
 use crate::buffer_codegen::{BufferCodegen, CodegenAlternative};
 use crate::completion_provider::{
     PromptCompletionProvider, PromptCompletionProviderDelegate, PromptContextType,
+    ThreadCompletionEntry,
 };
 use crate::mention_set::paste_images_as_context;
 use crate::mention_set::{MentionSet, crease_for_mention};
@@ -61,9 +62,9 @@ pub struct PromptEditor<T> {
     pub editor: Entity<Editor>,
     mode: PromptEditorMode,
     mention_set: Entity<MentionSet>,
-    history_store: Entity<HistoryStore>,
     prompt_store: Option<Entity<PromptStore>>,
     workspace: WeakEntity<Workspace>,
+    agent_sessions: Option<AgentSessions>,
     model_selector: Entity<AgentModelSelector>,
     edited_since_done: bool,
     prompt_history: VecDeque<String>,
@@ -329,10 +330,11 @@ impl<T: 'static> PromptEditor<T> {
     fn assign_completion_provider(&mut self, cx: &mut Context<Self>) {
         self.editor.update(cx, |editor, cx| {
             editor.set_completion_provider(Some(Rc::new(PromptCompletionProvider::new(
-                PromptEditorCompletionProviderDelegate,
+                PromptEditorCompletionProviderDelegate {
+                    agent_sessions: self.agent_sessions.clone(),
+                },
                 cx.weak_entity(),
                 self.mention_set.clone(),
-                self.history_store.clone(),
                 self.prompt_store.clone(),
                 self.workspace.clone(),
             ))));
@@ -1178,7 +1180,9 @@ impl InlineAssistId {
     }
 }
 
-struct PromptEditorCompletionProviderDelegate;
+struct PromptEditorCompletionProviderDelegate {
+    agent_sessions: Option<AgentSessions>,
+}
 
 fn inline_assistant_model_supports_images(cx: &App) -> bool {
     LanguageModelRegistry::read_global(cx)
@@ -1206,6 +1210,22 @@ impl PromptCompletionProviderDelegate for PromptEditorCompletionProviderDelegate
     }
 
     fn confirm_command(&self, _cx: &mut App) {}
+
+    fn thread_entries(&self, _cx: &App) -> Vec<ThreadCompletionEntry> {
+        let Some(sessions) = &self.agent_sessions else {
+            return Vec::new();
+        };
+        sessions
+            .get()
+            .into_iter()
+            .map(|session| {
+                ThreadCompletionEntry::agent_session(
+                    session.session_id.clone(),
+                    session.display_title(),
+                )
+            })
+            .collect()
+    }
 }
 
 impl PromptEditor<BufferCodegen> {
@@ -1217,10 +1237,10 @@ impl PromptEditor<BufferCodegen> {
         codegen: Entity<BufferCodegen>,
         session_id: Uuid,
         fs: Arc<dyn Fs>,
-        history_store: Entity<HistoryStore>,
         prompt_store: Option<Entity<PromptStore>>,
         project: WeakEntity<Project>,
         workspace: WeakEntity<Workspace>,
+        agent_sessions: Option<AgentSessions>,
         window: &mut Window,
         cx: &mut Context<PromptEditor<BufferCodegen>>,
     ) -> PromptEditor<BufferCodegen> {
@@ -1257,17 +1277,16 @@ impl PromptEditor<BufferCodegen> {
             editor
         });
 
-        let mention_set =
-            cx.new(|_cx| MentionSet::new(project, history_store.clone(), prompt_store.clone()));
+        let mention_set = cx.new(|_cx| MentionSet::new(project, prompt_store.clone()));
 
         let model_selector_menu_handle = PopoverMenuHandle::default();
 
         let mut this: PromptEditor<BufferCodegen> = PromptEditor {
             editor: prompt_editor.clone(),
             mention_set,
-            history_store,
             prompt_store,
             workspace,
+            agent_sessions,
             model_selector: cx.new(|cx| {
                 AgentModelSelector::new(
                     fs,
@@ -1375,10 +1394,10 @@ impl PromptEditor<TerminalCodegen> {
         codegen: Entity<TerminalCodegen>,
         session_id: Uuid,
         fs: Arc<dyn Fs>,
-        history_store: Entity<HistoryStore>,
         prompt_store: Option<Entity<PromptStore>>,
         project: WeakEntity<Project>,
         workspace: WeakEntity<Workspace>,
+        agent_sessions: Option<AgentSessions>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -1410,17 +1429,16 @@ impl PromptEditor<TerminalCodegen> {
             editor
         });
 
-        let mention_set =
-            cx.new(|_cx| MentionSet::new(project, history_store.clone(), prompt_store.clone()));
+        let mention_set = cx.new(|_cx| MentionSet::new(project, prompt_store.clone()));
 
         let model_selector_menu_handle = PopoverMenuHandle::default();
 
         let mut this = Self {
             editor: prompt_editor.clone(),
             mention_set,
-            history_store,
             prompt_store,
             workspace,
+            agent_sessions,
             model_selector: cx.new(|cx| {
                 AgentModelSelector::new(
                     fs,

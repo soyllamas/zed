@@ -1,11 +1,13 @@
 use crate::{
+    AgentPanel,
+    agent_panel::AgentSessions,
     context::load_context,
     inline_prompt_editor::{
         CodegenStatus, PromptEditor, PromptEditorEvent, TerminalInlineAssistId,
     },
     terminal_codegen::{CLEAR_INPUT, CodegenEvent, TerminalCodegen},
 };
-use agent::HistoryStore;
+
 use agent_settings::AgentSettings;
 use anyhow::{Context as _, Result};
 
@@ -61,7 +63,6 @@ impl TerminalInlineAssistant {
         terminal_view: &Entity<TerminalView>,
         workspace: WeakEntity<Workspace>,
         project: WeakEntity<Project>,
-        thread_store: Entity<HistoryStore>,
         prompt_store: Option<Entity<PromptStore>>,
         initial_prompt: Option<String>,
         window: &mut Window,
@@ -78,6 +79,12 @@ impl TerminalInlineAssistant {
         });
         let codegen = cx.new(|_| TerminalCodegen::new(terminal, session_id));
 
+        // Get shared agent sessions from AgentPanel for thread completions
+        let agent_sessions: Option<AgentSessions> = workspace
+            .upgrade()
+            .and_then(|ws| ws.read(cx).panel::<AgentPanel>(cx))
+            .map(|panel| panel.read(cx).agent_sessions());
+
         let prompt_editor = cx.new(|cx| {
             PromptEditor::new_terminal(
                 assist_id,
@@ -86,10 +93,10 @@ impl TerminalInlineAssistant {
                 codegen,
                 session_id,
                 self.fs.clone(),
-                thread_store.clone(),
                 prompt_store.clone(),
                 project.clone(),
                 workspace.clone(),
+                agent_sessions.clone(),
                 window,
                 cx,
             )

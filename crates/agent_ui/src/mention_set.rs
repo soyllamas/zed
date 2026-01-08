@@ -1,9 +1,10 @@
 use acp_thread::{MentionUri, selection_name};
-use agent::{HistoryStore, outline};
+use agent::outline;
 use agent_client_protocol as acp;
 use agent_servers::{AgentServer, AgentServerDelegate};
 use anyhow::{Context as _, Result, anyhow};
 use assistant_slash_commands::codeblock_fence_for_path;
+use assistant_text_thread::TextThreadStore;
 use collections::{HashMap, HashSet};
 use editor::{
     Anchor, Editor, EditorSnapshot, ExcerptId, FoldPlaceholder, ToOffset,
@@ -60,23 +61,24 @@ pub struct MentionImage {
 
 pub struct MentionSet {
     project: WeakEntity<Project>,
-    history_store: Entity<HistoryStore>,
+    text_thread_store: Option<Entity<TextThreadStore>>,
     prompt_store: Option<Entity<PromptStore>>,
     mentions: HashMap<CreaseId, (MentionUri, MentionTask)>,
 }
 
 impl MentionSet {
-    pub fn new(
-        project: WeakEntity<Project>,
-        history_store: Entity<HistoryStore>,
-        prompt_store: Option<Entity<PromptStore>>,
-    ) -> Self {
+    pub fn new(project: WeakEntity<Project>, prompt_store: Option<Entity<PromptStore>>) -> Self {
         Self {
             project,
-            history_store,
+            text_thread_store: None,
             prompt_store,
             mentions: HashMap::default(),
         }
+    }
+
+    #[allow(dead_code)]
+    pub fn set_text_thread_store(&mut self, store: Entity<TextThreadStore>) {
+        self.text_thread_store = Some(store);
     }
 
     pub fn contents(
@@ -475,10 +477,7 @@ impl MentionSet {
             return Task::ready(Err(anyhow!("project not found")));
         };
 
-        let server = Rc::new(agent::NativeAgentServer::new(
-            project.read(cx).fs().clone(),
-            self.history_store.clone(),
-        ));
+        let server = Rc::new(agent::NativeAgentServer::new(project.read(cx).fs().clone()));
         let delegate = AgentServerDelegate::new(
             project.read(cx).agent_server_store().clone(),
             project.clone(),
@@ -505,9 +504,11 @@ impl MentionSet {
         path: PathBuf,
         cx: &mut Context<Self>,
     ) -> Task<Result<Mention>> {
-        let text_thread_task = self.history_store.update(cx, |store, cx| {
-            store.load_text_thread(path.as_path().into(), cx)
-        });
+        let Some(text_thread_store) = self.text_thread_store.clone() else {
+            return Task::ready(Err(anyhow!("text thread store not available")));
+        };
+        let text_thread_task =
+            text_thread_store.update(cx, |store, cx| store.open_local(path.as_path().into(), cx));
         cx.spawn(async move |_, cx| {
             let text_thread = text_thread_task.await?;
             let xml = text_thread.update(cx, |text_thread, cx| text_thread.to_xml(cx));
