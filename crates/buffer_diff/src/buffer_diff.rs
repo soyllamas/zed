@@ -1287,6 +1287,7 @@ impl BufferDiff {
             })
     }
 
+    #[ztracing::instrument(skip_all)]
     pub fn language_changed(
         &mut self,
         language: Option<Arc<Language>>,

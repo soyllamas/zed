@@ -26,7 +26,9 @@ rope.workspace = true
 settings = { workspace = true, optional = true }
 sum_tree.workspace = true
 text.workspace = true
+tracing.workspace = true
 util.workspace = true
+ztracing.workspace = true
 
 [dev-dependencies]
 ctor.workspace = true

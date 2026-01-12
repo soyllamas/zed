@@ -738,6 +738,7 @@ impl GitStore {
         })
     }
 
+    #[ztracing::instrument(skip_all)]
     pub fn open_uncommitted_diff(
         &mut self,
         buffer: Entity<Buffer>,
@@ -790,6 +791,7 @@ impl GitStore {
         cx.background_spawn(async move { task.await.map_err(|e| anyhow!("{e}")) })
     }
 
+    #[ztracing::instrument(skip_all)]
     async fn open_diff_internal(
         this: WeakEntity<Self>,
         kind: DiffKind,
