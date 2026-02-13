@@ -91,11 +91,9 @@ impl RenderOnce for MentionCrease {
             .when_some(self.image_preview, |this, image_preview| {
                 this.hoverable_tooltip(image_preview)
             })
-            .when(
-                self.mention_uri.is_some() && self.workspace.is_some(),
-                |this| {
-                    let mention_uri = self.mention_uri.clone().unwrap();
-                    let workspace = self.workspace.clone().unwrap();
+            .when_some(
+                self.mention_uri.clone().zip(self.workspace.clone()),
+                |this, (mention_uri, workspace)| {
                     this.on_click(move |_event, window, cx| {
                         open_mention_uri(mention_uri.clone(), &workspace, window, cx);
                     })
