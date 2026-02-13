@@ -232,6 +232,8 @@ impl MentionSet {
                 content_len,
                 mention_uri.name().into(),
                 IconName::Image.path().into(),
+                Some(mention_uri.clone()),
+                Some(workspace.downgrade()),
                 Some(image),
                 editor.clone(),
                 window,
@@ -244,6 +246,8 @@ impl MentionSet {
                 content_len,
                 crease_text,
                 mention_uri.icon_path(cx),
+                Some(mention_uri.clone()),
+                Some(workspace.downgrade()),
                 None,
                 editor.clone(),
                 window,
@@ -690,6 +694,8 @@ pub(crate) async fn insert_images_as_context(
                 content_len,
                 MentionUri::PastedImage.name().into(),
                 IconName::Image.path().into(),
+                None,
+                None,
                 Some(Task::ready(Ok(image.clone())).shared()),
                 editor.clone(),
                 window,
@@ -800,7 +806,8 @@ pub(crate) fn insert_crease_for_mention(
     content_len: usize,
     crease_label: SharedString,
     crease_icon: SharedString,
-    // abs_path: Option<Arc<Path>>,
+    mention_uri: Option<MentionUri>,
+    workspace: Option<WeakEntity<Workspace>>,
     image: Option<Shared<Task<Result<Arc<Image>, String>>>>,
     editor: Entity<Editor>,
     window: &mut Window,
@@ -820,6 +827,8 @@ pub(crate) fn insert_crease_for_mention(
             render: render_mention_fold_button(
                 crease_label.clone(),
                 crease_icon.clone(),
+                mention_uri.clone(),
+                workspace.clone(),
                 start..end,
                 rx,
                 image,
@@ -1013,6 +1022,8 @@ fn render_directory_contents(entries: Vec<(Arc<RelPath>, String, String)>) -> St
 fn render_mention_fold_button(
     label: SharedString,
     icon: SharedString,
+    mention_uri: Option<MentionUri>,
+    workspace: Option<WeakEntity<Workspace>>,
     range: Range<Anchor>,
     mut loading_finished: postage::barrier::Receiver,
     image_task: Option<Shared<Task<Result<Arc<Image>, String>>>>,
@@ -1032,6 +1043,8 @@ fn render_mention_fold_button(
             id: cx.entity_id(),
             label,
             icon,
+            mention_uri: mention_uri.clone(),
+            workspace: workspace.clone(),
             range,
             editor,
             loading: Some(loading),
@@ -1045,6 +1058,8 @@ struct LoadingContext {
     id: EntityId,
     label: SharedString,
     icon: SharedString,
+    mention_uri: Option<MentionUri>,
+    workspace: Option<WeakEntity<Workspace>>,
     range: Range<Anchor>,
     editor: WeakEntity<Editor>,
     loading: Option<Task<()>>,
@@ -1061,6 +1076,8 @@ impl Render for LoadingContext {
         let id = ElementId::from(("loading_context", self.id));
 
         MentionCrease::new(id, self.icon.clone(), self.label.clone())
+            .mention_uri(self.mention_uri.clone())
+            .workspace(self.workspace.clone())
             .is_toggled(is_in_text_selection)
             .is_loading(self.loading.is_some())
             .when_some(self.image.clone(), |this, image_task| {
